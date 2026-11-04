@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arabic + English speech to text</title>
+<style>
+  :root { --bg: #ffffff; --fg: #1d1d1f; --muted: #6b6b72; --line: #dcdce1; --card: #f6f6f8; --accent: #2457d6;
+          --accent-fg: #ffffff; --err: #b3261e; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #121214; --fg: #ececf1; --muted: #9a9aa3; --line: #2e2e33; --card: #1b1b1f; --accent: #6b8cff;
+            --accent-fg: #0b0b0d; --err: #ff8a80; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, -apple-system, "Segoe UI",
+         Roboto, "Noto Sans Arabic", sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 32px 16px 48px; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 24px; font-size: .95rem; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+  .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+  label { font-weight: 600; font-size: .9rem; }
+  input[type=file] { max-width: 100%; }
+  select, button { font: inherit; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--fg);
+                   padding: 8px 12px; }
+  button { cursor: pointer; }
+  button.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 600; }
+  button:disabled { opacity: .5; cursor: default; }
+  .or { color: var(--muted); font-size: .9rem; }
+  #status { color: var(--muted); min-height: 1.5em; margin: 8px 0 0; }
+  #status.err { color: var(--err); }
+  #text { white-space: pre-wrap; font-size: 1.15rem; line-height: 1.7; margin: 0; }
+  .meta { color: var(--muted); font-size: .9rem; margin-top: 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: .95rem; margin-top: 8px; }
+  td { border-top: 1px solid var(--line); padding: 6px 8px 6px 0; vertical-align: top; }
+  td.t { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; width: 1%; }
+  td.l { color: var(--muted); width: 1%; }
+  details { margin-top: 8px; }
+  code, pre { font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  pre { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px; overflow-x: auto; }
+  a { color: var(--accent); }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Arabic + English speech to text</h1>
+  <p class="sub">Model: <a href="https://huggingface.co/Cohere-AR/cohere-transcribe-ar-sft-v9-full-s86k">Cohere-AR/cohere-transcribe-ar-sft-v9-full-s86k</a>,
+    a community fine-tune of Cohere Transcribe Arabic (not made or endorsed by Cohere) for phone calls, Arabic dialects,
+    English and code-switched speech. No key needed.</p>
+
+  <div class="card">
+    <div class="row">
+      <label for="file">Audio file</label>
+      <input id="file" type="file" accept="audio/*,video/*,.wav,.mp3,.m4a,.flac,.ogg,.opus,.webm,.aac,.amr">
+    </div>
+    <div class="row" style="margin-top:12px">
+      <span class="or">or</span>
+      <button id="rec" type="button">Record from microphone</button>
+      <span id="recinfo" class="or"></span>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <label for="lang">Language</label>
+      <select id="lang">
+        <option value="auto">Automatic (Arabic, English or mixed)</option>
+        <option value="ar">Arabic</option>
+        <option value="en">English</option>
+      </select>
+      <label class="or"><input id="level" type="checkbox" checked> Normalise input level</label>
+      <button id="go" class="primary" type="button" disabled>Transcribe</button>
+    </div>
+    <details style="margin-top:12px">
+      <summary>Reference text (optional): get the word error rate</summary>
+      <textarea id="reference" dir="auto" rows="4" style="width:100%;margin-top:8px;font:inherit;border-radius:8px;
+        border:1px solid var(--line);background:var(--bg);color:var(--fg);padding:8px"
+        placeholder="Paste the correct transcript here"></textarea>
+    </details>
+    <audio id="player" class="hidden" controls style="width:100%;margin-top:12px"></audio>
+    <p id="status"></p>
+  </div>
+
+  <div id="result" class="card hidden">
+    <p id="text" dir="auto"></p>
+    <p class="meta" id="meta"></p>
+    <p class="meta hidden" id="wer"></p>
+    <details>
+      <summary>Segments</summary>
+      <table id="segs"></table>
+    </details>
+    <details>
+      <summary>Normalised text (Arabic Arena scoring normaliser)</summary>
+      <p id="normtext" dir="auto" class="meta"></p>
+    </details>
+  </div>
+
+  <div class="card">
+    <details>
+      <summary>Use it from code</summary>
+      <pre id="curl"></pre>
+      <p class="meta">OpenAI-style route: <code>POST /v1/audio/transcriptions</code>. Interactive API docs: <a href="docs">/docs</a>.</p>
+    </details>
+    <p class="meta">Up to 100 MB and 30 minutes per file. Stereo calls are mixed to mono; audio over 30 s is cut at
+      pauses into pieces of at most 25 s. Audio and transcripts are not stored.</p>
+  </div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const base = location.origin + location.pathname.replace(/\/[^/]*$/, "");
+$("curl").textContent = `curl -F file=@call.wav -F language=auto ${base}/transcribe`;
+let blob = null, name = "audio";
+let recorder = null, chunks = [], started = 0, timer = null;
+
+function setStatus(msg, err) { $("status").textContent = msg; $("status").className = err ? "err" : ""; }
+function ready(b, n) {
+  blob = b; name = n; $("go").disabled = !b;
+  const p = $("player");
+  if (b) { p.src = URL.createObjectURL(b); p.classList.remove("hidden"); } else { p.classList.add("hidden"); }
+}
+
+$("file").addEventListener("change", (e) => {
+  const f = e.target.files[0];
+  if (f) { ready(f, f.name); setStatus(""); }
+});
+
+$("rec").addEventListener("click", async () => {
+  if (recorder && recorder.state === "recording") { recorder.stop(); return; }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    recorder = new MediaRecorder(stream);
+    chunks = [];
+    recorder.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+    recorder.onstop = () => {
+      stream.getTracks().forEach((t) => t.stop());
+      clearInterval(timer);
+      const type = recorder.mimeType || "audio/webm";
+      const ext = type.includes("mp4") ? "m4a" : type.includes("ogg") ? "ogg" : "webm";
+      ready(new Blob(chunks, { type }), "recording." + ext);
+      $("rec").textContent = "Record again";
+      $("recinfo").textContent = ((Date.now() - started) / 1000).toFixed(1) + " s recorded";
+      $("file").value = "";
+    };
+    recorder.start();
+    started = Date.now();
+    $("rec").textContent = "Stop recording";
+    timer = setInterval(() => { $("recinfo").textContent = ((Date.now() - started) / 1000).toFixed(0) + " s"; }, 500);
+    setStatus("");
+  } catch (err) {
+    setStatus("Microphone not available: " + err.message, true);
+  }
+});
+
+$("go").addEventListener("click", async () => {
+  if (!blob) return;
+  const fd = new FormData();
+  fd.append("file", blob, name);
+  fd.append("language", $("lang").value);
+  fd.append("level", $("level").checked ? "true" : "false");
+  if ($("reference").value.trim()) fd.append("reference", $("reference").value);
+  $("go").disabled = true;
+  setStatus("Transcribing…");
+  const t = Date.now();
+  try {
+    const r = await fetch(base + "/transcribe", { method: "POST", body: fd });
+    const d = await r.json().catch(() => ({ detail: r.statusText }));
+    if (!r.ok) throw new Error(d.detail || ("HTTP " + r.status));
+    $("text").textContent = d.text || "(no speech recognised)";
+    $("meta").textContent = `Language: ${d.language || "—"} · audio ${d.duration.toFixed(1)} s · ` +
+      `server ${d.processing_time.toFixed(2)} s · round trip ${((Date.now() - t) / 1000).toFixed(2)} s`;
+    $("normtext").textContent = d.normalized_text || "";
+    const w = $("wer");
+    if (d.wer) {
+      const pct = (x) => x.wer === null ? "—" : (100 * x.wer).toFixed(2) + "%";
+      w.textContent = `WER against the reference: ${pct(d.wer.l2)} with the Arabic Arena normaliser ` +
+        `(${d.wer.l2.edits} edits / ${d.wer.l2.reference_words} words), ${pct(d.wer.ext)} with normalize_ext`;
+      w.classList.remove("hidden");
+    } else {
+      w.classList.add("hidden");
+    }
+    const segs = $("segs");
+    segs.replaceChildren();
+    for (const s of d.segments) {
+      const tr = segs.insertRow();
+      tr.insertCell().textContent = `${s.start.toFixed(1)}–${s.end.toFixed(1)} s`;
+      tr.cells[0].className = "t";
+      tr.insertCell().textContent = s.language;
+      tr.cells[1].className = "l";
+      const c = tr.insertCell();
+      c.textContent = s.text;
+      c.dir = "auto";
+    }
+    $("result").classList.remove("hidden");
+    setStatus("");
+  } catch (err) {
+    setStatus("Error: " + err.message, true);
+  } finally {
+    $("go").disabled = false;
+  }
+});
+</script>
+</body>
+</html>

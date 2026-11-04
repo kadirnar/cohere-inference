@@ -1,0 +1,182 @@
+# Arabic Arena variant table: same-lexeme spelling variants folded at normalization level L2.
+# Admission rule: the same word with the same meaning, spelled differently or written as it is
+# reduced in speech. Never synonyms or dialect alternants (ايش/شو/ايه, عايز/بدي, هلق/الحين).
+# Keys and values are in L1 spelling (ة->ه, ى->ي, hamza dropped). A multi-word key is replaced on
+# the joined text before tokenization. Changing this file changes scores: bump VARIANTS_VERSION
+# in sttarena/normalizers/variants.py and re-run the collision audit (sttarena audit variants).
+# Known, documented collisions: الي (MSA "to", after L1) is folded with اللي; ميه is both "water"
+# (Egyptian) and "hundred"; علي is "on", "on me" and the name Ali; كت is sometimes كانت; متين is
+# also MSA "solid".
+# variant	canonical	dialects	class	source
+ف	في	EGY,LEV	particle	MGB-3 IAA (1083)
+ع	علي	ALL	particle	MGB-3 IAA (518)
+عا	علي	ALL	particle	MGB-3 IAA
+عل	علي	TUN	particle	CODA*
+م	من	EGY	particle	MGB-3 IAA (299)
+برضو	برضه	EGY	particle	MGB-3 IAA (545)
+بردو	برضه	EGY	particle	MGB-3 IAA
+برده	برضه	EGY	particle	MGB-3 IAA
+دا	ده	EGY	demonstrative	MGB-3 IAA (79)
+ديه	دي	EGY	demonstrative	MGB-3 IAA (23)
+كدا	كده	EGY	demonstrative	MGB-3 IAA; CODA* prefers كده
+علشان	عشان	EGY,LEV	particle	MGB-3 IAA (57)
+موش	مش	EGY,TUN	particle	MGB-3 IAA
+دلوقت	دلوقتي	EGY	particle	MGB-3 IAA (31)
+ياللا	يلا	ALL	particle	MGB-3 IAA (57)
+يالا	يلا	ALL	particle	MGB-3 IAA
+يللا	يلا	ALL	particle	MGB-3 IAA
+ايوا	ايوه	EGY	particle	MGB-3 IAA
+اوي	قوي	EGY	particle	MGB-3 IAA (ق realised as glottal stop)
+برا	بره	EGY,LEV	particle	MGB-3 IAA (144)
+جوا	جوه	EGY,LEV	particle	MGB-3 IAA (26)
+طاب	طب	EGY	particle	MGB-3 IAA (63)
+جمب	جنب	EGY	particle	MGB-3 IAA (assimilation)
+ولله	والله	ALL	particle	observed
+هم	هما	EGY	pronoun	MGB-3 IAA (372)
+انتم	انتو	EGY,LEV	pronoun	MGB-3 IAA
+هوي	هو	LEV	pronoun	MADAR raw->CODA
+هيي	هي	LEV	pronoun	MADAR raw->CODA
+الي	اللي	ALL	relative	MGB-3 IAA; Casablanca/NADI mix both
+ليا	لي	EGY,MOR	pronoun	MGB-3 IAA (41)
+بيا	بي	EGY	pronoun	MGB-3 IAA
+عليا	علي	EGY	pronoun	MGB-3 IAA (62)
+معايه	معايا	EGY	pronoun	MGB-3 IAA
+معاي	معايا	EGY,LEV	pronoun	MADAR raw->CODA
+انو	انه	LEV	particle	MADAR raw->CODA
+لانو	لانه	LEV	particle	MADAR raw->CODA
+بكرا	بكره	LEV,EGY	particle	MADAR raw->CODA
+هاذا	هذا	GLF,LEV	demonstrative	SADA mixes هذي/هاذي
+هاذي	هذي	GLF,LEV	demonstrative	SADA mixes هذي/هاذي
+هاذاك	هذاك	GLF	demonstrative	CODA*
+هاذيك	هذيك	GLF	demonstrative	CODA*
+هاذيلا	هذيلا	GLF	demonstrative	CODA*
+بش	باش	TUN	particle	MADAR raw->CODA
+متع	متاع	TUN	particle	MADAR raw->CODA
+برشه	برشا	TUN	particle	MADAR raw->CODA
+شنوه	شنو	TUN	particle	MADAR raw->CODA
+وخا	واخا	MOR	particle	MADAR raw->CODA
+عافاك	عفاك	MOR	particle	MADAR raw->CODA
+كات	كانت	EGY	verb	MGB-3 IAA (117)
+كت	كنت	EGY	verb	MGB-3 IAA (292)
+بتاعت	بتاعه	EGY	particle	MGB-3 IAA (94)
+بظبط	بالظبط	EGY	particle	MGB-3 IAA
+عاوز	عايز	EGY	verb	MGB-3 IAA (26)
+عاوزه	عايزه	EGY	verb	MGB-3 IAA
+عاوزين	عايزين	EGY	verb	MGB-3 IAA
+مياه	ميه	EGY	noun	MGB-3 IAA (56)
+المياه	الميه	EGY	noun	MGB-3 IAA (57)
+تلفزيون	تليفزيون	ALL	loanword	MGB-3 IAA (31)
+التلفزيون	التليفزيون	ALL	loanword	MGB-3 IAA
+اوكيه	اوكي	ALL	loanword	MGB-3 IAA (222)
+اوكاي	اوكي	ALL	loanword	observed
+اوك	اوكي	ALL	loanword	MGB-3 IAA
+ok	اوكي	ALL	loanword	Mixat transcript/transliteration
+okay	اوكي	ALL	loanword	Mixat transcript/transliteration (147)
+okey	اوكي	ALL	loanword	observed
+sorry	سوري	ALL	loanword	MGB-3 IAA (28)
+bye	باي	ALL	loanword	Mixat transcript/transliteration (18)
+hello	هالو	ALL	loanword	observed
+هلو	هالو	ALL	loanword	observed
+merci	ميرسي	MAG,LEV	loanword	observed
+مرسي	ميرسي	MAG,LEV	loanword	observed
+فاصله	فاصل	ALL	number	decimal point
+المايه	الميه	ALL	number	percent
+بالميه	في الميه	ALL	number	percent
+بالمايه	في الميه	ALL	number	percent
+في المايه	في الميه	ALL	number	percent
+ان شا الله	انشالله	ALL	multiword	MGB-3 IAA
+انشا الله	انشالله	ALL	multiword	MGB-3 IAA
+ان شالله	انشالله	ALL	multiword	MGB-3 IAA
+انشاالله	انشالله	ALL	multiword	MGB-3 IAA
+ما شا الله	ماشالله	ALL	multiword	MGB-3 IAA
+ماشاالله	ماشالله	ALL	multiword	MGB-3 IAA
+مشالله	ماشالله	ALL	multiword	MGB-3 IAA
+# --- from the error audit (2026-10-18): same-lexeme pairs observed in model outputs vs references, reviewed;
+# rejected there: عدنا (MSA 'we returned'), ويش/اش ('what' variants are lexical), يعرفوا/تكونوا (MSA mood),
+# اكلو ('they ate'), لميه ('to a hundred'), ابن ('بن' is also 'coffee')
+يالسه	جالسه	GLF	verb	error audit: 20 clean utterances, 31 ops on 15 sets (3 models); Emirati ج->ي
+يالس	جالس	GLF	verb	error audit: 5 clean utterances, 8 ops on 15 sets (3 models); Emirati ج->ي
+يالسين	جالسين	GLF	verb	error audit: 4 clean utterances, 6 ops on 15 sets (3 models); Emirati ج->ي
+يلسه	جالسه	GLF	verb	error audit: 3 clean utterances, 3 ops on 15 sets (3 models); Emirati ج->ي, reduced
+ايلس	اجلس	GLF	verb	error audit: 4 clean utterances, 12 ops on 15 sets (3 models); Emirati ج->ي
+يديد	جديد	GLF	adjective	error audit: 6 clean utterances, 11 ops on 15 sets (3 models); Emirati ج->ي
+يديده	جديده	GLF	adjective	error audit: 12 clean utterances, 23 ops on 15 sets (3 models); Emirati ج->ي
+اليايه	الجايه	GLF	adjective	error audit: 6 clean utterances, 11 ops on 15 sets (3 models); Emirati ج->ي
+ييت	جيت	GLF	verb	error audit: 3 clean utterances, 5 ops on 15 sets (3 models); Emirati ج->ي
+تيني	تجيني	GLF	verb	error audit: 4 clean utterances, 5 ops on 15 sets (3 models); Emirati ج->ي
+الشارجه	الشارقه	GLF	name	error audit: 9 clean utterances, 22 ops on 15 sets (3 models); Emirati ق->ج (Sharjah)
+اجول	اقول	GLF	verb	error audit: 4 clean utterances, 4 ops on 15 sets (3 models); Emirati ق->ج
+اجولكم	اقولكو	GLF	verb	error audit: 4 clean utterances, 4 ops on 15 sets (3 models); Emirati ق->ج
+جدام	قدام	GLF	particle	error audit: 2 clean utterances, 8 ops on 15 sets (3 models); Gulf ق->ج
+وجلنا	وقلنا	GLF	verb	error audit: 3 clean utterances, 9 ops on 15 sets (3 models); Emirati ق->ج
+الطريج	الطريق	GLF	noun	error audit: 3 clean utterances, 7 ops on 15 sets (3 models); Emirati ق->ج
+نغول	نقول	GLF	verb	error audit: 1 clean utterances, 9 ops on 15 sets (3 models); Bedouin ق->g spelled غ
+عندج	عندك	GLF	pronoun	error audit: 6 clean utterances, 12 ops on 15 sets (3 models); Emirati/Kuwaiti 2sg fem. ـج
+عليج	عليك	GLF	pronoun	error audit: 3 clean utterances, 6 ops on 15 sets (3 models); Emirati/Kuwaiti ـج
+بالج	بالك	GLF	pronoun	error audit: 3 clean utterances, 4 ops on 15 sets (3 models); Emirati/Kuwaiti ـج
+انج	انك	GLF	pronoun	error audit: 4 clean utterances, 6 ops on 15 sets (3 models); Emirati/Kuwaiti ـج
+كيفتش	كيفك	GLF	pronoun	error audit: 1 clean utterances, 8 ops on 15 sets (3 models); Najdi affricated ك
+باجر	باكر	GLF	particle	error audit: 5 clean utterances, 11 ops on 15 sets (3 models); Emirati 'tomorrow'
+باتشر	باكر	GLF	particle	error audit: 3 clean utterances, 4 ops on 15 sets (3 models); Emirati 'tomorrow'
+رح	راح	LEV,GLF	particle	error audit: 26 clean utterances, 77 ops on 15 sets (3 models); future particle, reduced
+خلنا	خلينا	GLF	verb	error audit: 17 clean utterances, 29 ops on 15 sets (3 models); reduced
+بينا	بيننا	ALL	pronoun	error audit: 3 clean utterances, 10 ops on 15 sets (3 models); reduced
+خوي	اخوي	GLF	noun	error audit: 1 clean utterances, 1 ops on 15 sets (3 models); initial alef dropped
+خوك	اخوك	GLF	noun	error audit: 3 clean utterances, 5 ops on 15 sets (3 models); initial alef dropped
+خويا	اخويا	GLF,EGY	noun	error audit: 1 clean utterances, 2 ops on 15 sets (3 models); initial alef dropped
+ختي	اختي	GLF	noun	error audit: 1 clean utterances, 3 ops on 15 sets (3 models); initial alef dropped
+بو	ابو	GLF	noun	error audit: 4 clean utterances, 9 ops on 15 sets (3 models); kunya without alef: بو محمد
+عطونا	اعطونا	GLF	verb	error audit: 5 clean utterances, 12 ops on 15 sets (3 models); initial alef dropped
+اهنا	هنا	GLF	particle	error audit: 6 clean utterances, 20 ops on 15 sets (3 models); prothetic alef
+اهني	هني	GLF	particle	error audit: 2 clean utterances, 5 ops on 15 sets (3 models); prothetic alef
+اهنيه	هني	GLF	particle	error audit: 4 clean utterances, 10 ops on 15 sets (3 models); prothetic alef + final ه
+انكون	نكون	GLF	verb	error audit: 5 clean utterances, 13 ops on 15 sets (3 models); prothetic alef
+اتكون	تكون	GLF	verb	error audit: 3 clean utterances, 8 ops on 15 sets (3 models); prothetic alef
+اتخيلوا	تخيلو	GLF	verb	error audit: 5 clean utterances, 14 ops on 15 sets (3 models); prothetic alef
+اتخيلت	تخيلت	GLF	verb	error audit: 3 clean utterances, 6 ops on 15 sets (3 models); prothetic alef
+اتخرجوا	تخرجو	GLF	verb	error audit: 1 clean utterances, 9 ops on 15 sets (3 models); prothetic alef
+اتخرجت	تخرجت	GLF	verb	error audit: 5 clean utterances, 16 ops on 15 sets (3 models); prothetic alef
+ذحين	دحين	GLF	particle	error audit: 2 clean utterances, 12 ops on 15 sets (3 models); Hijazi 'now', ذ/د spelling
+نحنا	نحن	GLF,LEV	pronoun	error audit: 36 clean utterances, 57 ops on 15 sets (3 models); Emirati/Levantine 'we'
+بديت	بدات	GLF	verb	error audit: 4 clean utterances, 9 ops on 15 sets (3 models); Gulf 'I started'
+اكتر	اكثر	EGY,LEV	adjective	error audit: 6 clean utterances, 17 ops on 15 sets (3 models); ث->ت
+كتير	كثير	EGY,LEV	adjective	error audit: 6 clean utterances, 10 ops on 15 sets (3 models); ث->ت
+تاني	ثاني	EGY,LEV	adjective	error audit: 7 clean utterances, 14 ops on 15 sets (3 models); ث->ت
+تانيه	ثانيه	EGY,LEV	adjective	error audit: 4 clean utterances, 5 ops on 15 sets (3 models); ث->ت
+الزرات	الذرات	EGY	noun	error audit: 2 clean utterances, 6 ops on 15 sets (3 models); Egyptian ذ->ز
+معاك	معك	ALL	pronoun	error audit: 7 clean utterances, 28 ops on 15 sets (3 models); long vowel written
+معاه	معه	ALL	pronoun	error audit: 11 clean utterances, 20 ops on 15 sets (3 models); long vowel written
+معاهم	معهم	ALL	pronoun	error audit: 5 clean utterances, 13 ops on 15 sets (3 models); long vowel written
+معي	معايا	ALL	pronoun	error audit: 16 clean utterances, 35 ops on 15 sets (3 models); repo canonical معايا
+تيجي	تجي	EGY,GLF	verb	error audit: 7 clean utterances, 20 ops on 15 sets (3 models); long vowel written
+ييجي	يجي	EGY,GLF	verb	error audit: 1 clean utterances, 12 ops on 15 sets (3 models); long vowel written
+شويه	شوي	ALL	particle	error audit: 13 clean utterances, 23 ops on 15 sets (3 models); final ه
+يبا	يبه	GLF	noun	error audit: 3 clean utterances, 10 ops on 15 sets (3 models); final ا/ه
+يما	يمه	GLF	noun	error audit: 4 clean utterances, 15 ops on 15 sets (3 models); final ا/ه
+ويايا	وياي	GLF	pronoun	error audit: 11 clean utterances, 24 ops on 15 sets (3 models); final ا
+ويايه	وياي	GLF	pronoun	error audit: 3 clean utterances, 4 ops on 15 sets (3 models); final ه
+ويد	وايد	GLF	particle	error audit: 13 clean utterances, 13 ops on 15 sets (3 models); spelling
+ترا	تري	GLF	particle	error audit: 8 clean utterances, 21 ops on 15 sets (3 models); ترى with final ا
+عيشتنه	عيشتنا	EGY	noun	error audit: 1 clean utterances, 1 ops on 15 sets (3 models); ـنا spelled ـنه
+ورجالتو	ورجالته	GLF,EGY	noun	error audit: 1 clean utterances, 11 ops on 15 sets (3 models); 3sg suffix ـو
+وانو	وانه	LEV,GLF	particle	error audit: 2 clean utterances, 9 ops on 15 sets (3 models); 3sg suffix ـو (انو/انه is in the table)
+الفلم	الفيلم	ALL	loanword	error audit: 5 clean utterances, 19 ops on 15 sets (3 models); loanword spelling
+فلم	فيلم	ALL	loanword	error audit: 4 clean utterances, 7 ops on 15 sets (3 models); loanword spelling
+الاميركيه	الامريكيه	ALL	loanword	error audit: 2 clean utterances, 14 ops on 15 sets (3 models); spelling
+الفدرالي	الفيدرالي	ALL	loanword	error audit: 1 clean utterances, 11 ops on 15 sets (3 models); spelling
+الاوليمبيه	الاولمبيه	ALL	loanword	error audit: 1 clean utterances, 12 ops on 15 sets (3 models); spelling
+السوفييتي	السوفيتي	ALL	loanword	error audit: 1 clean utterances, 11 ops on 15 sets (3 models); spelling
+شينغن	شنغن	ALL	name	error audit: 1 clean utterances, 8 ops on 15 sets (3 models); spelling
+شنجن	شنغن	ALL	name	error audit: 1 clean utterances, 12 ops on 15 sets (3 models); g as ج
+جوما	غوما	ALL	name	error audit: 2 clean utterances, 38 ops on 15 sets (3 models); g as ج/غ
+الكتالونيه	الكاتالونيه	ALL	loanword	error audit: 3 clean utterances, 10 ops on 15 sets (3 models); spelling
+التليفون	التلفون	ALL	loanword	error audit: 6 clean utterances, 11 ops on 15 sets (3 models); spelling
+الاستديو	الاستوديو	ALL	loanword	error audit: 3 clean utterances, 4 ops on 15 sets (3 models); spelling
+الطونا	التونه	ALL	loanword	error audit: 1 clean utterances, 1 ops on 15 sets (3 models); spelling
+واعيين	واعين	ALL	adjective	error audit: 6 clean utterances, 13 ops on 15 sets (3 models); doubled ي
+المتنزهات	المنتزهات	ALL	noun	error audit: 1 clean utterances, 12 ops on 15 sets (3 models); both spellings in use
+ستينات	ستينيات	ALL	noun	error audit: 2 clean utterances, 4 ops on 15 sets (3 models); both forms in use
+لاني	لانني	ALL	particle	error audit: 5 clean utterances, 8 ops on 15 sets (3 models); both forms in use
+الحمدالله	الحمدلله	ALL	particle	error audit: 1 clean utterances, 1 ops on 15 sets (3 models); misspelling
+فهته	فهاته	ALL	demonstrative	error audit: 1 clean utterances, 1 ops on 15 sets (3 models); dagger alef
+بالضبط	بالظبط	ALL	particle	error audit: 4 clean utterances, 10 ops on 15 sets (3 models); repo canonical بالظبط

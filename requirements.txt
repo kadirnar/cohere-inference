@@ -1,0 +1,16 @@
+# Python 3.11; a CUDA GPU with ~6 GB free. Install torch for your CUDA version first (e.g. torch 2.11 + cu128).
+torch
+transformers>=5.4  # CohereAsrForConditionalGeneration (tested with 5.20.2)
+numpy
+soundfile
+soxr
+silero-vad
+onnxruntime
+fastapi==0.115.12
+uvicorn==0.34.2
+python-multipart==0.0.20
+regex
+rapidfuzz
+whisper-normalizer==1.0.0
+requests  # wer.py and the test scripts
+pyarrow  # test and study scripts

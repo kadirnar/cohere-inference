@@ -1,0 +1,21 @@
+# environments, binaries, machine settings
+.venv/
+bin/
+local.env
+.env
+__pycache__/
+*.pyc
+.ruff_cache/
+# logs and outputs (may hold transcripts)
+logs/
+results/
+norm_study/*.txt
+norm_study/*.log
+norm_study/*.err
+# test audio and data built by test/make_clips.py (public datasets, rebuilt locally, not redistributed here)
+test/*.wav
+test/*.m4a
+test/*.webm
+test/*.ogg
+test/*.m3u8
+test/clips.json
