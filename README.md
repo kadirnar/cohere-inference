@@ -53,8 +53,8 @@ print(client.audio.transcriptions.create(model="s86k", file=open("call.wav", "rb
 The response has `text` (the model's own words), `normalized_text` (the same under the Arabic Arena's scoring
 normaliser), `language`, `duration`, `processing_time`, `level`, `segments` (start, end, language, text,
 normalized_text) and, with a reference, `wer` (`l2`: Arabic Arena normaliser, `ext`: the Test Arabic ASR Benchmark's
-`normalize_ext`; edits, reference words, WER). Limits: 100 MB, 30 minutes of audio, one request at a time on the GPU
-with 8 waiting (503 beyond). Audio and transcripts are kept in memory only (uploads over 1 MB spool to `TMPDIR`); the
+`normalize_ext`; edits, reference words, WER). Limits: 100 MB, 30 minutes of audio, 128 requests in flight (503 beyond);
+requests that arrive together are decoded together in shared GPU batches. Audio and transcripts are kept in memory only (uploads over 1 MB spool to `TMPDIR`); the
 log holds timings, sizes and access lines (client address, route, status), no audio or text.
 
 ## What happens to the audio
@@ -122,6 +122,23 @@ normaliser) the WER goes from 12.57 (`level=false`) to 12.26. The measurement co
 take the same 0.27 s for a 6.8 s clip and 1.9 s for a 114 s two-channel call). Two earlier versions measured speech
 with Silero instead: one also levelled normal-level mono audio and cost 0.1-0.5 WER on three sets at their own level;
 the other matched these figures (Audioluna 12.38) but added 0.05-1.7 s per request, a second network pass.
+
+**Concurrent requests** (`bench/concurrency.py`: 50 different FLEURS / LibriSpeech clips, 454 s of audio, posted at the
+same moment from the same machine). Requests are prepared in parallel threads and the pieces of all waiting requests
+are decoded together, at most 32 per GPU batch; each request is answered as soon as its own pieces are done.
+
+| | answered | p50 latency | slowest | audio seconds per second |
+|---|---|---|---|---|
+| one request at a time, 8 queued (before) | 8 of 50 (42 × 503) | 1.98 s | 2.80 s | 24 |
+| one request at a time, queue of 100 | 50 | 8.54 s | 17.72 s | 26 |
+| shared batches (now), local | 50 | 2.11 s | 3.78 s | 120 |
+| shared batches (now), through the public tunnel | 50 | 5.80 s | 7.31 s | 62 |
+
+A lone request takes the same time as before (0.3 s for a 9 s clip). Sharing a batch can change a transcript slightly
+(bf16 padding): 98 of 100 clips came out identical one at a time and all at once (`bench/batch_consistency.py`; Arena
+L2 WER 2.82 % and 3.04 %), and the Audioluna calls score 12.22 against 12.26 before. `bench/speed.py` compares the
+service with the model card's plain code: the same speed on clips up to 30 s, about half the speed on long
+recordings (Silero cuts them at pauses on the CPU), with a lower WER on the Audioluna calls (12.26 against 12.74).
 
 ## Normalisers (`textnorm/`, `norm_study/`)
 

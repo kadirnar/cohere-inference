@@ -29,10 +29,7 @@ def engine():
         spec = importlib.util.spec_from_file_location("server", ROOT / "server.py")
         server = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(server)
-        from silero_vad import load_silero_vad
-
-        _engine = server.Engine.__new__(server.Engine)
-        _engine.vad = load_silero_vad(onnx=True)
+        _engine = server.Engine  # level() needs no model
     return _engine
 
 

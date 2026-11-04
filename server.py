@@ -16,7 +16,8 @@ pauses (Silero speech regions) into pieces of at most 25 s, greedy decoding, and
 header unless a language is given. Before that, the input level is normalised (see the LEVEL constants; level=false
 takes the plain mean of the channels instead, as the Arabic Arena feeds the model). The text is the model's own;
 normalized_text is the same text under the Arabic Arena's scoring normaliser (textnorm), for matching and WER.
-Requests run one at a time on the GPU and at most MAX_WAITING wait; the rest get 503. Audio and text are kept in memory only (temporary files go to TMPDIR,
+Requests are prepared in parallel threads and their pieces decoded together in shared GPU batches (Batcher); at
+most MAX_WAITING are in flight, the rest get 503. Audio and text are kept in memory only (temporary files go to TMPDIR,
 a RAM disk in start.sh, and are deleted with the request); the log has timings, sizes and uvicorn's access lines
 (client address, route, status), no audio or text.
 
@@ -33,6 +34,7 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -55,12 +57,15 @@ MODEL = os.environ.get("MODEL", MODEL_ID)
 PORT = int(os.environ.get("PORT", "8086"))
 MAX_MB = float(os.environ.get("MAX_MB", "100"))
 MAX_MINUTES = float(os.environ.get("MAX_MINUTES", "30"))
-MAX_WAITING = int(os.environ.get("MAX_WAITING", "8"))
+MAX_WAITING = int(os.environ.get("MAX_WAITING", "128"))  # requests in flight before new ones get 503
 SR = 16000
 WHOLE_S = 30  # audio up to this long goes to the model in one piece, as the card says and the Arena runs it
 PIECE_S = 25  # longer audio is cut at pauses into pieces of at most this long
-BATCH_SECONDS = 400  # audio seconds in one GPU batch
-MAX_BATCH = 16
+# Pieces of all waiting requests are decoded together: at most MAX_BATCH pieces and BATCH_SECONDS of (padded) audio
+# per GPU batch, after waiting BATCH_WAIT_S for requests that arrive at the same moment.
+BATCH_SECONDS = 600
+MAX_BATCH = 32
+BATCH_WAIT_S = 0.005
 MAX_NEW_TOKENS = 448  # the model card's value (the Arabic Arena runs it with 440)
 LANGUAGES = ("auto", "ar", "en")
 # Input level (on by default, level=false turns it off), measured from the signal alone, so the only network a request
@@ -130,13 +135,21 @@ def load_audio(data: bytes) -> np.ndarray:
 
 class Engine:
     def __init__(self, model_dir: str):
-        from silero_vad import load_silero_vad
         from transformers import CohereAsrForConditionalGeneration, CohereAsrProcessor
 
         kw = {} if os.path.isdir(model_dir) else {"revision": REVISION}
         self.processor = CohereAsrProcessor.from_pretrained(model_dir, **kw)
         self.model = CohereAsrForConditionalGeneration.from_pretrained(model_dir, dtype=torch.bfloat16, **kw).cuda().eval()
-        self.vad = load_silero_vad(onnx=True)
+        self._local = threading.local()
+
+    @property
+    def vad(self):
+        """Silero for this thread (it keeps state, so concurrent requests each need their own)."""
+        from silero_vad import load_silero_vad
+
+        if not hasattr(self._local, "vad"):
+            self._local.vad = load_silero_vad(onnx=True)
+        return self._local.vad
 
     def pieces(self, x: np.ndarray) -> list[tuple[int, int]]:
         """(start, end) samples: the whole audio up to 30 s, otherwise Silero speech regions packed into pieces of at
@@ -192,57 +205,123 @@ class Engine:
             mix = np.sum([ch if (lv := cls.speech_level(ch)) is None else gained(ch, lv) for ch in chans], axis=0)
         return (mix / max(1.0, float(np.abs(mix).max()) / 0.99)).astype(np.float32)
 
-    @torch.no_grad()
-    def __call__(self, x: np.ndarray, language: str = "auto", punctuation: bool = True, level: bool = True) -> list[dict]:
-        """Segments of (samples, channels) audio: levelled to mono, or the mean of the channels with level=False."""
+    def prepare(self, x: np.ndarray, level: bool = True) -> tuple[np.ndarray, list[tuple[int, int]]]:
+        """(mono audio, pieces) of (samples, channels) audio: levelled, or the mean of the channels with level=False."""
         x = self.level(x) if level else x.mean(axis=1).astype(np.float32)
-        spans = self.pieces(x)
-        texts, langs = [""] * len(spans), [language] * len(spans)
-        batches, cur = [], []
-        for i in sorted(range(len(spans)), key=lambda i: spans[i][1] - spans[i][0]):
-            n = spans[i][1] - spans[i][0]
-            if cur and (n * (len(cur) + 1) > BATCH_SECONDS * SR or len(cur) >= MAX_BATCH):
-                batches.append(cur)
+        return x, self.pieces(x)
+
+    @staticmethod
+    def batches(lengths: list[int]) -> list[list[int]]:
+        """Indices grouped into GPU batches, shortest first, within MAX_BATCH pieces and BATCH_SECONDS padded."""
+        out, cur = [], []
+        for i in sorted(range(len(lengths)), key=lambda i: lengths[i]):
+            if cur and (lengths[i] * (len(cur) + 1) > BATCH_SECONDS * SR or len(cur) >= MAX_BATCH):
+                out.append(cur)
                 cur = []
             cur.append(i)
-        if cur:
-            batches.append(cur)
+        return out + [cur] if cur else out
+
+    @torch.no_grad()
+    def decode(self, audio: list[np.ndarray], language: str, punctuation: bool) -> list[tuple[str, str]]:
+        """(text, language) of each piece, in one generate call."""
         auto = language == "auto"
-        tok = self.processor.tokenizer
-        for idx in batches:
-            audio = [x[spans[i][0]:spans[i][1]] for i in idx]
-            inputs = self.processor(audio=audio, sampling_rate=SR, language="ar" if auto else language,
-                                    punctuation=punctuation, return_tensors="pt")
+        inputs = self.processor(audio=audio, sampling_rate=SR, language="ar" if auto else language,
+                                punctuation=punctuation, return_tensors="pt")
+        if auto:
+            inputs["decoder_input_ids"] = inputs["decoder_input_ids"][:, :4]  # up to <|emo:undefined|>
+        inputs.pop("audio_chunk_index", None)  # pieces are within the feature extractor's 30 s, so never cut
+        inputs = {k: v.cuda().to(torch.bfloat16) if v.is_floating_point() else v.cuda() for k, v in inputs.items()}
+        gen = self.model.generate(**inputs, do_sample=False, max_new_tokens=MAX_NEW_TOKENS)
+        assert len(gen) == len(audio)
+        tok, out = self.processor.tokenizer, []
+        for raw, text in zip(tok.batch_decode(gen), tok.batch_decode(gen, skip_special_tokens=True)):
+            text = " ".join(text.split())
             if auto:
-                inputs["decoder_input_ids"] = inputs["decoder_input_ids"][:, :4]  # up to <|emo:undefined|>
-            inputs.pop("audio_chunk_index", None)  # pieces are within the feature extractor's 30 s, so never cut
-            inputs = {k: v.cuda().to(torch.bfloat16) if v.is_floating_point() else v.cuda() for k, v in inputs.items()}
-            gen = self.model.generate(**inputs, do_sample=False, max_new_tokens=MAX_NEW_TOKENS)
-            assert len(gen) == len(idx)
-            for i, raw, text in zip(idx, tok.batch_decode(gen), tok.batch_decode(gen, skip_special_tokens=True)):
-                texts[i] = " ".join(text.split())
-                if auto:
-                    m = HEADER.search(raw)
-                    langs[i] = m.group(1) if m else ("ar" if ARABIC.search(texts[i]) else "en")
-        return [{"start": round(s / SR, 2), "end": round(e / SR, 2), "language": lang, "text": text}
-                for (s, e), lang, text in zip(spans, langs, texts)]
+                m = HEADER.search(raw)
+                out.append((text, m.group(1) if m else ("ar" if ARABIC.search(text) else "en")))
+            else:
+                out.append((text, language))
+        return out
+
+    def __call__(self, x: np.ndarray, language: str = "auto", punctuation: bool = True, level: bool = True) -> list[dict]:
+        """Segments of one recording ((samples, channels)), decoded on its own (the scripts' entry point)."""
+        x, spans = self.prepare(x, level)
+        audio = [x[s:e] for s, e in spans]
+        res: list[tuple[str, str]] = [("", language)] * len(spans)
+        for idx in self.batches([len(a) for a in audio]):
+            for i, r in zip(idx, self.decode([audio[i] for i in idx], language, punctuation)):
+                res[i] = r
+        return segments(spans, res)
+
+
+def segments(spans: list[tuple[int, int]], results: list[tuple[str, str]]) -> list[dict]:
+    return [{"start": round(s / SR, 2), "end": round(e / SR, 2), "language": lang, "text": text}
+            for (s, e), (text, lang) in zip(spans, results)]
+
+
+class Batcher:
+    """Decodes the pieces of every waiting request together: one loop owns the GPU and takes all requests queued while
+    it was busy, groups their pieces by prompt (language, punctuation) and runs them in shared batches."""
+
+    def __init__(self, engine: Engine):
+        self.engine, self.queue = engine, asyncio.Queue()
+
+    async def submit(self, audio: list[np.ndarray], language: str, punctuation: bool) -> list[tuple[str, str]]:
+        future = asyncio.get_running_loop().create_future()
+        await self.queue.put((audio, language, punctuation, future))
+        return await future
+
+    async def run(self) -> None:
+        while True:
+            jobs = [await self.queue.get()]
+            await asyncio.sleep(BATCH_WAIT_S)
+            while not self.queue.empty():
+                jobs.append(self.queue.get_nowait())
+            results = [[None] * len(audio) for audio, _, _, _ in jobs]
+            groups: dict[tuple[str, bool], list[tuple[int, int]]] = {}
+            for j, (audio, language, punctuation, _) in enumerate(jobs):
+                for k in range(len(audio)):
+                    groups.setdefault((language, punctuation), []).append((j, k))
+            left = [len(audio) for audio, _, _, _ in jobs]
+            for j, n in enumerate(left):
+                if n == 0:  # no speech found: nothing to decode
+                    jobs[j][3].set_result([])
+            try:
+                for (language, punctuation), items in groups.items():
+                    audio = [jobs[j][0][k] for j, k in items]
+                    for idx in self.engine.batches([len(a) for a in audio]):
+                        out = await asyncio.to_thread(self.engine.decode, [audio[i] for i in idx], language, punctuation)
+                        for i, r in zip(idx, out):
+                            j, k = items[i]
+                            results[j][k] = r
+                            left[j] -= 1
+                            if left[j] == 0 and not jobs[j][3].done():  # answer each request as soon as it is complete
+                                jobs[j][3].set_result(results[j])
+                log.info("batched requests=%d pieces=%d", len(jobs), sum(len(r) for r in results))
+            except Exception as e:  # noqa: BLE001 (passed on to every waiting request)
+                for _, _, _, future in jobs:
+                    if not future.done():
+                        future.set_exception(e)
 
 
 # ---- app -----------------------------------------------------------------------------------------------------------
 
 engine: Engine | None = None
-gpu = asyncio.Lock()
+batcher: Batcher | None = None
 waiting = 0
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global engine
+    global engine, batcher
     t = time.time()
     engine = await asyncio.to_thread(Engine, MODEL)
     await asyncio.to_thread(engine, np.zeros((SR, 1), dtype=np.float32))  # warm-up
+    batcher = Batcher(engine)
+    task = asyncio.create_task(batcher.run())
     log.info("ready: %s (%s) from %s in %.0f s", MODEL_ID, REVISION[:10], MODEL, time.time() - t)
     yield
+    task.cancel()
 
 
 app = FastAPI(title="Cohere-AR sft-v9-full-s86k speech-to-text", version=REVISION[:10], lifespan=lifespan,
@@ -280,31 +359,31 @@ async def run(file: UploadFile, language: str, punctuation: bool, level: bool = 
         raise HTTPException(413, f"audio too long (max {MAX_MINUTES:g} minutes)")
     if duration < 0.1:
         raise HTTPException(400, "audio too short")
-    if engine is None:
+    if batcher is None:
         raise HTTPException(503, "model is loading, try again shortly")
     if waiting >= MAX_WAITING:
         raise HTTPException(503, "busy, try again in a minute")
     waiting += 1
     try:
-        async with gpu:
-            t1 = time.time()
-            segments = await asyncio.to_thread(engine, x, language, punctuation, level)
+        mono, spans = await asyncio.to_thread(engine.prepare, x, level)
+        t1 = time.time()
+        segs = segments(spans, await batcher.submit([mono[s:e] for s, e in spans], language, punctuation))
     finally:
         waiting -= 1
     t2 = time.time()
     seconds: dict[str, float] = {}
-    for s in segments:
+    for s in segs:
         s["normalized_text"] = textnorm.normalize(s["text"], s["language"] if s["language"] in ("ar", "en") else None)
         if s["text"]:
             seconds[s["language"]] = seconds.get(s["language"], 0) + s["end"] - s["start"]
-    log.info("transcribed audio_s=%.1f bytes=%d channels=%d language=%s level=%s pieces=%d wait_s=%.2f gpu_s=%.2f "
-             "total_s=%.2f", duration, len(data), x.shape[1], language, level, len(segments), t1 - t0, t2 - t1, t2 - t0)
-    text = " ".join(s["text"] for s in segments if s["text"])
+    log.info("transcribed audio_s=%.1f bytes=%d channels=%d language=%s level=%s pieces=%d prep_s=%.2f queue_gpu_s=%.2f "
+             "total_s=%.2f", duration, len(data), x.shape[1], language, level, len(segs), t1 - t0, t2 - t1, t2 - t0)
+    text = " ".join(s["text"] for s in segs if s["text"])
     out = {"model": MODEL_ID, "revision": REVISION,
            "language": max(seconds, key=seconds.get) if seconds else (language if language != "auto" else ""),
            "duration": round(duration, 2), "processing_time": round(t2 - t0, 2), "level": level, "text": text,
-           "normalized_text": " ".join(s["normalized_text"] for s in segments if s["normalized_text"]),
-           "segments": segments}
+           "normalized_text": " ".join(s["normalized_text"] for s in segs if s["normalized_text"]),
+           "segments": segs}
     if reference.strip():
         out["wer"] = textnorm.wer(reference, text)
     return out
