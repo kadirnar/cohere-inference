@@ -63,16 +63,16 @@ BATCH_SECONDS = 400  # audio seconds in one GPU batch
 MAX_BATCH = 16
 MAX_NEW_TOKENS = 448  # the model card's value (the Arabic Arena runs it with 440)
 LANGUAGES = ("auto", "ar", "en")
-# Input level (on by default, level=false turns it off). A two-channel call: each channel's speech (the loudest 30 %
-# of 50 ms frames inside Silero's speech regions) is brought to -20 dBFS (at most +30 dB) and the channels are summed,
-# so both sides are equally loud. Mono (and copies of one channel): left exactly as it is unless it is quiet (speech
-# under -45 dBFS, or no measurable speech and a 99.9th-percentile sample under -30 dBFS), where WER starts to suffer:
-# then it is raised until that sample reaches -6 dBFS (at most +60 dB; Silero and the feature extractor's dither
-# floor miss speech below about -50 dBFS) and its speech brought to -20 dBFS. A channel without speech even when made
-# audible is never amplified.
-BOOST_PEAK, BOOST_MAX_DB = 0.5, 60.0
-LEVEL_DBFS, LEVEL_MAX_GAIN_DB = -20.0, 30.0
-QUIET_DBFS, QUIET_PEAK = -45.0, 10 ** (-30 / 20)
+# Input level (on by default, level=false turns it off), measured from the signal alone, so the only network a request
+# runs is the ASR model (and Silero for audio over 30 s, as without it). A channel's speech level is the RMS of its
+# loudest 20 % of 50 ms frames; a channel whose loudest and quietest 20 % of frames are less than 12 dB apart (silence,
+# steady noise or tones) has no speech to level and is never amplified. A two-channel call: each channel's speech is
+# brought to -20 dBFS (at most +60 dB) and the channels are summed, so both sides are equally loud. Mono (and copies of
+# one channel): left exactly as it is unless its speech is under -45 dBFS, where WER starts to suffer (the feature
+# extractor's dither floor), and then brought to -20 dBFS. The result is kept under 0.99 full scale.
+FRAME = SR // 20
+TOP_SHARE, SPEECH_RANGE_DB = 0.2, 12.0
+LEVEL_DBFS, LEVEL_MAX_GAIN_DB, QUIET_DBFS = -20.0, 60.0, -45.0
 # Demuxers ffmpeg may use; playlist and concat formats (hls, dash, concat, ...) stay out, so an upload cannot make
 # ffmpeg open other files or URLs.
 DEMUXERS = "wav,w64,mp3,flac,ogg,mov,matroska,aac,amr,amrnb,amrwb,aiff,caf,au,asf,wv,ape,gsm,mpeg,mpegts,avi,flv"
@@ -159,46 +159,37 @@ class Engine:
             out.append((max(0, start - SR // 5), min(len(x), end + SR // 5)))
         return out
 
-    def speech_level(self, ch: np.ndarray) -> tuple[float | None, float]:
-        """(dBFS of the loudest 30 % of 50 ms frames inside Silero's speech regions, or None under 1 s of speech;
-        seconds of speech)."""
-        from silero_vad import get_speech_timestamps
+    @staticmethod
+    def speech_level(ch: np.ndarray) -> float | None:
+        """dBFS of the loudest TOP_SHARE of 50 ms frames; None when there is no speech to level (under 0.25 s, digital
+        silence, or loudest and quietest frames under SPEECH_RANGE_DB apart)."""
+        n = len(ch) // FRAME
+        if n < 5:
+            return None
+        e = np.sort((ch[: n * FRAME].astype(np.float64).reshape(n, FRAME) ** 2).mean(axis=1))
+        k = max(1, int(n * TOP_SHARE))
+        top, low = float(e[-k:].mean()), float(e[:k].mean())
+        if top <= 1e-12 or 10 * np.log10(top / max(low, 1e-20)) < SPEECH_RANGE_DB:
+            return None
+        return 10 * float(np.log10(top))
 
-        self.vad.reset_states()
-        regions = get_speech_timestamps(torch.from_numpy(np.ascontiguousarray(ch, dtype=np.float32)), self.vad,
-                                        sampling_rate=SR, threshold=0.5)
-        speech = np.concatenate([ch[r["start"]:r["end"]] for r in regions]) if regions else np.zeros(0, np.float32)
-        if len(speech) < SR:
-            return None, len(speech) / SR
-        n = SR // 20
-        rms = np.sqrt((speech[: len(speech) // n * n].reshape(-1, n) ** 2).mean(axis=1))
-        return float(20 * np.log10(np.sort(rms)[-max(1, int(len(rms) * 0.3)):].mean() + 1e-9)), len(speech) / SR
-
-    def _levelled(self, ch: np.ndarray) -> np.ndarray:
-        """One channel raised if very quiet, then its speech brought to LEVEL_DBFS; unchanged if it has no speech."""
-        peak = float(np.percentile(np.abs(ch), 99.9))
-        y = ch * float(10 ** (min(BOOST_MAX_DB, 20 * np.log10(BOOST_PEAK / peak)) / 20)) if 0 < peak < BOOST_PEAK else ch
-        level, seconds = self.speech_level(y)
-        if seconds < 0.2:  # no speech even when made audible: leave the channel as it came (no amplified noise)
-            return ch.astype(np.float32)
-        if level is not None:
-            y = y * float(10 ** (min(LEVEL_MAX_GAIN_DB, LEVEL_DBFS - level) / 20))
-        return y.astype(np.float32)
-
-    def level(self, x: np.ndarray) -> np.ndarray:
+    @classmethod
+    def level(cls, x: np.ndarray) -> np.ndarray:
         """Mono for the model: see the LEVEL constants. Returns the plain mean for audio that needs no change."""
+        def gained(ch, lv):
+            return ch * float(10 ** (min(LEVEL_MAX_GAIN_DB, LEVEL_DBFS - lv) / 20))
+
         chans = [x[:, c] for c in range(x.shape[1])]
         if len(chans) > 1 and min(chans[0].std(), chans[1].std()) > 0 and np.corrcoef(chans[0], chans[1])[0, 1] > 0.9:
             chans = [x.mean(axis=1)]  # copies of one channel
         if len(chans) == 1:
             ch = chans[0].astype(np.float32)
-            level, _ = self.speech_level(ch)
-            quiet = level < QUIET_DBFS if level is not None else float(np.percentile(np.abs(ch), 99.9)) < QUIET_PEAK
-            if not quiet:
+            lv = cls.speech_level(ch)
+            if lv is None or lv >= QUIET_DBFS:
                 return ch
-            mix = self._levelled(ch)
+            mix = gained(ch, lv)
         else:
-            mix = np.sum([self._levelled(ch) for ch in chans], axis=0)
+            mix = np.sum([ch if (lv := cls.speech_level(ch)) is None else gained(ch, lv) for ch in chans], axis=0)
         return (mix / max(1.0, float(np.abs(mix).max()) / 0.99)).astype(np.float32)
 
     @torch.no_grad()

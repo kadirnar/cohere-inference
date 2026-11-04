@@ -62,11 +62,13 @@ log holds timings, sizes and access lines (client address, route, status), no au
 1. Decoding: libsndfile (wav, flac, ogg, mp3), otherwise ffmpeg (m4a, aac, webm, ...) with `-protocol_whitelist file`
    and a demuxer whitelist, so an uploaded playlist or concat file cannot open other files or URLs.
 2. 16 kHz with soxr, channels kept.
-3. Input level (`level=true`): a two-channel call has each channel's speech (the loudest 30 % of 50 ms frames inside
-   Silero's speech regions) brought to -20 dBFS (at most +30 dB) before the sum, so both sides are equally loud. Mono
-   audio is left bit for bit as it is unless it is quiet (speech under -45 dBFS, or a 99.9th-percentile sample under
-   -30 dBFS when too little speech is found); then it is raised (at most +60 dB) and levelled. A channel without speech
-   is never amplified. `level=false` takes the plain mean of the channels, as the Arabic Arena feeds the model.
+3. Input level (`level=true`), measured from the signal alone, so a request runs no network besides the ASR model
+   (and Silero for audio over 30 s, as without it): a channel's speech level is the RMS of its loudest 20 % of 50 ms
+   frames, and a channel whose loudest and quietest 20 % of frames are less than 12 dB apart (silence, steady noise,
+   tones) is never amplified. A two-channel call has each channel's speech brought to -20 dBFS (at most +60 dB) before
+   the sum, so both sides are equally loud. Mono audio is left bit for bit as it is unless its speech is under -45 dBFS;
+   then it is brought to -20 dBFS. `level=false` takes the plain mean of the channels, as the Arabic Arena feeds the
+   model.
 4. Audio up to 30 s goes to the model whole (as the model card says and the Arena runs it); longer audio is cut at
    pauses (Silero) into pieces of at most 25 s, decoded in batches.
 5. Greedy decoding, at most 448 new tokens (the card's value). With `language=auto` the decoder prompt stops after
@@ -99,22 +101,27 @@ reproduces the published WER v2, v1 and CER exactly.
 In `auto` mode the model picked the right language on 897 of 900 English and 1,146 of 1,150 Arabic clips
 (`test/lang_check.py`); code-switched clips get an Arabic header with the English words kept.
 
-**Input level** (`norm_study/validate_level.py`, 150 clips per set, language forced): at the clips' own level `level=true`
-changes none of 900 clips (the WER is that of `level=false`); 40 and 60 dB quieter:
+**Input level** (`norm_study/validate_level.py`, 150 clips per set, language forced): at the clips' own level the six
+sets score exactly as with `level=false`; 40 and 60 dB quieter:
 
 | Set | own level | -40 dB: off → on | -60 dB: off → on |
 |---|---|---|---|
-| fleurs_ar/clean | 3.45 | 3.55 → 3.41 | 9.46 → 3.41 |
-| sada/telephony_v2 | 22.15 | 25.26 → 22.32 | 44.17 → 22.15 |
-| casablanca/callcenter_v2 | 52.19 | 56.58 → 52.82 | 74.46 → 53.86 |
+| fleurs_ar/clean | 3.45 | 3.55 → 3.41 | 9.46 → 3.45 |
+| sada/telephony_v2 | 22.15 | 25.26 → 21.80 | 44.17 → 22.28 |
+| casablanca/callcenter_v2 | 52.19 | 56.58 → 52.40 | 74.46 → 53.93 |
 | librispeech_clean/clean | 1.03 | 1.07 → 1.14 | 1.64 → 1.14 |
-| edacc/clean | 12.55 | 15.51 → 12.55 | 24.79 → 12.52 |
-| earnings22/telephony | 7.05 | 8.22 → 7.26 | 19.88 → 7.26 |
+| edacc/clean | 12.55 | 15.51 → 12.59 | 24.79 → 12.59 |
+| earnings22/telephony | 7.05 | 8.22 → 7.26 | 19.88 → 7.13 |
 
-Text on the Arena's noise-only clips is unchanged (Arabic: any text 36.3 %, 3+ words 35.7 %, on and off). On 20 private
-two-channel and mono call recordings (Audioluna, scored against human-reviewed references with the Arena normaliser)
-the WER goes from 12.57 (`level=false`) to 12.38. An earlier version that also levelled normal-level mono audio helped
-quiet audio as much but cost 0.1-0.5 WER on three sets at their own level, hence the rule above.
+On the Arena's noise-only clips the share with 3+ words is 35.7 % → 35.7 % (Arabic) and 96.0 % → 96.3 % (English, one
+clip). Over every Arena clip (`norm_study/arena_input_check.py`, `arena_level_effect.py`) `level=true` changes 37 of
+30,080 Arabic and 697 of 17,305 English clips (quiet FLEURS-en and AMI recordings, speech around -57 dBFS) and moves
+s86k's Arena WER v2 from 12.279 to 12.280 (Arabic) and from 6.042 to 6.032 (English; FLEURS-en clean 5.52 → 5.35). On
+20 private two-channel and mono call recordings (Audioluna, scored against human-reviewed references with the Arena
+normaliser) the WER goes from 12.57 (`level=false`) to 12.26. The measurement costs no time (`level=false` and `true`
+take the same 0.27 s for a 6.8 s clip and 1.9 s for a 114 s two-channel call). Two earlier versions measured speech
+with Silero instead: one also levelled normal-level mono audio and cost 0.1-0.5 WER on three sets at their own level;
+the other matched these figures (Audioluna 12.38) but added 0.05-1.7 s per request, a second network pass.
 
 ## Normalisers (`textnorm/`, `norm_study/`)
 
