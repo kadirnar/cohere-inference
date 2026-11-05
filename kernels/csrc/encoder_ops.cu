@@ -82,15 +82,17 @@ __global__ void layernorm_kernel(__nv_bfloat16* x, int ldx, const __nv_bfloat16*
 // Transformer-XL attention of the FastConformer (ParakeetEncoderAttention) for one head and 64 query rows of one
 // sequence per CTA (4 warps x 16 rows), head size 160:
 //   score[i, j] = ((q_i + u) . k_j) * scale + bf16(bf16((q_i + v) . R[i - j]) * scale)
-// with R[d] the projected sinusoid of relative distance d (a per-layer table, rows d + rel_off). The position term of
-// all the tile's rows and every distance they need is computed first into shared memory (bf16, rounded as the module
-// rounds it), then keys and values stream through in tiles of 32 with an online softmax (fp32), the probabilities
-// rounded to bf16 for the value product, as PyTorch's attention kernels do.
+// with R[d] the projected sinusoid of relative distance d (a per-layer table, rows d + rel_off). Keys and values
+// stream through in tiles of 32 with an online softmax (fp32), the probabilities rounded to bf16 for the value product,
+// as PyTorch's attention kernels do; the position term (bf16, rounded as the module rounds it) is computed 32
+// distances at a time as the key tiles need it, into a ring in shared memory. (Computed for all distances up front it
+// took (len + 63) x 64 x 2 bytes: one CTA an SM for sequences over 150 frames, a third slower.)
 constexpr int AD = 160;       // head size
 constexpr int ADP = AD + 8;   // padded shared-memory row: ldmatrix rows fall in distinct banks
 constexpr int ABM = 64;       // query rows per CTA
 constexpr int ABN = 32;       // keys per tile
 constexpr int AKS = AD / 16;  // k16 steps over the head size
+constexpr int RING_LD = 4 * ABN + 8;  // a row of the position-term ring (4 chunks), padded off bank alignment
 
 struct AttnArgs {
   const __nv_bfloat16* qkv;  // (rows, 3 * H * AD): q | k | v
@@ -99,7 +101,7 @@ struct AttnArgs {
   const __nv_bfloat16* bv;   // (H, AD)
   __nv_bfloat16* out;        // (rows, H * AD)
   const int4* tiles;         // (seq start, seq length, first query row, 0)
-  int H, rel_off, rel_rows, pd_cols;
+  int H, rel_off, rel_rows;
   float scale;
 };
 
@@ -141,79 +143,82 @@ DEVI void cp_tile32(const __nv_bfloat16* src, int ld, int col0, int r0, int n_va
   }
 }
 
+// the position term of the tile's 64 rows for 32 distances (the chunk whose 32 table rows sR holds) into ring slot
+// `slot` of sP, each warp its own 16 rows: bf16(bf16((q + v) . R[d]) * scale), as the module rounds it
+DEVI void position_chunk(const uint32_t (&a)[AKS][4], const __nv_bfloat16* sR, __nv_bfloat16* sP, int warp, int lane,
+                         float scale, int slot) {
+  const int g = lane >> 2, t = lane & 3;
+  float acc[4][4] = {};
+#pragma unroll
+  for (int ks = 0; ks < AKS; ++ks) {
+#pragma unroll
+    for (int nj = 0; nj < 2; ++nj) {
+      uint32_t b0, b1, b2, b3;
+      ldmatrix_x4(b0, b1, b2, b3, sR + (nj * 16 + ((lane >> 4) << 3) + (lane & 7)) * ADP + ks * 16 + ((lane >> 3) & 1) * 8);
+      mma_bf16(acc[2 * nj], a[ks], b0, b1);
+      mma_bf16(acc[2 * nj + 1], a[ks], b2, b3);
+    }
+  }
+#pragma unroll
+  for (int ni = 0; ni < 4; ++ni)
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+      const int r = warp * 16 + g + half * 8, c = slot * ABN + ni * 8 + 2 * t;
+      *reinterpret_cast<uint32_t*>(sP + r * RING_LD + c) =
+          pack_bf16(round_bf(acc[ni][half * 2]) * scale, round_bf(acc[ni][half * 2 + 1]) * scale);
+    }
+}
+
 __global__ void __launch_bounds__(128, 2) relpos_attention_kernel(const AttnArgs p) {
-  // one 64 x 168 region serves in turn as the query tile, the double-buffered distance-table chunks and the key and
-  // value tiles (single buffers, loaded alternately), so two CTAs fit an SM beside their position blocks
+  // the query tile is staged where the key, value and distance-table tiles go afterwards; the position term lives in a
+  // ring of 4 chunks of 32 distances (a key tile's scores read 95 consecutive distances, one chunk further down per
+  // tile), so the shared memory does not grow with the sequence and two CTAs fit an SM
   extern __shared__ __align__(128) unsigned char smem_raw[];
   __nv_bfloat16* sA = reinterpret_cast<__nv_bfloat16*>(smem_raw);
-  __nv_bfloat16* sQ = sA;                        // 64 x 168
-  __nv_bfloat16* sR = sA;                        // 2 x 32 x 168
+  __nv_bfloat16* sQ = sA;                        // 64 x 168 (staging)
   __nv_bfloat16* sK = sA;                        // 32 x 168
   __nv_bfloat16* sV = sA + ABN * ADP;            // 32 x 168
-  __nv_bfloat16* sPD = sA + 2 * ABN * ADP;       // 64 x pd_cols
+  __nv_bfloat16* sR = sA + 2 * ABN * ADP;        // 32 x 168
+  __nv_bfloat16* sP = sA + 3 * ABN * ADP;        // 64 x RING_LD
 
   const int4 tile = p.tiles[blockIdx.x];
   const int start = tile.x, len = tile.y, q0 = tile.z, h = blockIdx.y;
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
   const int ld = 3 * p.H * AD;
-  // distances i - j of this tile: q0 - (len - 1) ... q0 + 63
+  // distances i - j of this tile: q0 - (len - 1) ... q0 + 63, column c = d - dmin of the position term
   const int dmin = q0 - len + 1;
-  const int n_dist = len + ABM - 1;
-
-  // ---- position term: sPD[r][c] = bf16(bf16((q + v)_r . R[dmin + c]) * scale) ----
-  load_q_plus(p, start, len, q0, h, p.bv, sQ);
-  auto load_r = [&](int buf, int c0) {
-    __nv_bfloat16* s = sR + buf * ABN * ADP;
+  const int n_chunks = (len + ABM - 1 + ABN - 1) / ABN;
+  auto load_r = [&](int chunk, __nv_bfloat16* dst) {
     for (int id = tid; id < ABN * (AD / 8); id += blockDim.x) {
       const int r = id / (AD / 8), c = (id % (AD / 8)) * 8;
-      const int row = min(max(dmin + c0 + r + p.rel_off, 0), p.rel_rows - 1);
-      cp_async16(s + r * ADP + c, p.rk + (size_t)row * (p.H * AD) + h * AD + c, true);
+      const int row = min(max(dmin + chunk * ABN + r + p.rel_off, 0), p.rel_rows - 1);
+      cp_async16(dst + r * ADP + c, p.rk + (size_t)row * (p.H * AD) + h * AD + c, true);
     }
   };
-  __syncthreads();
-  {
-    uint32_t a[AKS][4];
-    load_a_frags(sQ, warp, lane, a);
-    __syncthreads();  // the query tile is in registers: its space takes the distance chunks
-    load_r(0, 0);
-    cp_async_commit();
-    int buf = 0;
-    for (int c0 = 0; c0 < n_dist; c0 += ABN, buf ^= 1) {
-      if (c0 + ABN < n_dist) load_r(buf ^ 1, c0 + ABN);
-      cp_async_commit();
-      cp_async_wait<1>();
-      __syncthreads();
-      const __nv_bfloat16* s = sR + buf * ABN * ADP;
-      float acc[4][4] = {};
-#pragma unroll
-      for (int ks = 0; ks < AKS; ++ks) {
-#pragma unroll
-        for (int nj = 0; nj < 2; ++nj) {
-          uint32_t b0, b1, b2, b3;
-          ldmatrix_x4(b0, b1, b2, b3,
-                      s + (nj * 16 + ((lane >> 4) << 3) + (lane & 7)) * ADP + ks * 16 + ((lane >> 3) & 1) * 8);
-          mma_bf16(acc[2 * nj], a[ks], b0, b1);
-          mma_bf16(acc[2 * nj + 1], a[ks], b2, b3);
-        }
-      }
-#pragma unroll
-      for (int ni = 0; ni < 4; ++ni)
-#pragma unroll
-        for (int half = 0; half < 2; ++half) {
-          const int r = warp * 16 + g + half * 8, c = c0 + ni * 8 + 2 * t;
-          *reinterpret_cast<uint32_t*>(sPD + r * p.pd_cols + c) =
-              pack_bf16(round_bf(acc[ni][half * 2]) * p.scale, round_bf(acc[ni][half * 2 + 1]) * p.scale);
-        }
-      __syncthreads();  // sR[buf] is refilled two chunks later
-    }
-  }
 
-  // ---- content term and softmax over key tiles ----
-  uint32_t qa[AKS][4];
+  uint32_t pa[AKS][4], qa[AKS][4];  // (q + v) for the position term, (q + u) for the content term
+  load_q_plus(p, start, len, q0, h, p.bv, sQ);
+  __syncthreads();
+  load_a_frags(sQ, warp, lane, pa);
+  __syncthreads();
   load_q_plus(p, start, len, q0, h, p.bu, sQ);
   __syncthreads();
   load_a_frags(sQ, warp, lane, qa);
-  __syncthreads();  // sQ is overwritten by the key/value tiles
+  __syncthreads();
+
+  // the first key tile reads columns len - 32 ... len + 62: chunks lo0 ... n_chunks - 1 (at most 4), up to 3 at a time
+  // (the key and value tiles' space is free until the key loop)
+  const int lo0 = max(0, (len - ABN) / ABN);
+  for (int c = n_chunks - 1; c >= lo0; c -= 3) {
+    __nv_bfloat16* buf[3] = {sR, sK, sV};
+    const int n = min(3, c - lo0 + 1);
+    for (int k = 0; k < n; ++k) load_r(c - k, buf[k]);
+    cp_async_commit();
+    cp_async_wait<0>();
+    __syncthreads();
+    for (int k = 0; k < n; ++k) position_chunk(pa, buf[k], sP, warp, lane, p.scale, (c - k) & 3);
+    __syncthreads();
+  }
 
   float o[AD / 8][4];
 #pragma unroll
@@ -221,16 +226,17 @@ __global__ void __launch_bounds__(128, 2) relpos_attention_kernel(const AttnArgs
   float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.f, 0.f};
 
   const __nv_bfloat16* kbase = p.qkv + (size_t)start * ld;
-  // K(j) and V(j) in their own buffers, as cp.async groups K0, V0, K1, V1, ...: K(j+1) loads during the softmax and
-  // the value product of tile j, V(j+1) during the scores of tile j+1
+  // cp.async groups K0, V0, (K1 + the chunk tile 1 adds), V1, ...: K(j+1) loads during the softmax and the value
+  // product of tile j, V(j+1) during the scores of tile j+1
   cp_tile32(kbase, ld, p.H * AD + h * AD, 0, len, sK);
   cp_async_commit();
   cp_tile32(kbase, ld, 2 * p.H * AD + h * AD, 0, len, sV);
   cp_async_commit();
-  for (int j0 = 0; j0 < len; j0 += ABN) {
+  for (int jt = 0, j0 = 0; j0 < len; ++jt, j0 += ABN) {
     const bool more = j0 + ABN < len;
     cp_async_wait<1>();
     __syncthreads();
+    if (jt > 0 && lo0 - jt >= 0) position_chunk(pa, sR, sP, warp, lane, p.scale, (lo0 - jt) & 3);
     float s[4][4] = {};
 #pragma unroll
     for (int ks = 0; ks < AKS; ++ks) {
@@ -243,10 +249,14 @@ __global__ void __launch_bounds__(128, 2) relpos_attention_kernel(const AttnArgs
         mma_bf16(s[2 * nj + 1], qa[ks], b2, b3);
       }
     }
-    __syncthreads();  // every warp is done with K(j)
-    if (more) cp_tile32(kbase, ld, p.H * AD + h * AD, j0 + ABN, len, sK);
+    __syncthreads();  // every warp is done with K(j) and the table chunk
+    if (more) {
+      cp_tile32(kbase, ld, p.H * AD + h * AD, j0 + ABN, len, sK);
+      if (lo0 - jt - 1 >= 0) load_r(lo0 - jt - 1, sR);
+    }
     cp_async_commit();
-    // scores: content * scale + position term (sPD column i - j - dmin), keys past the sequence masked
+    __syncwarp();  // the warp's ring rows, written by its lanes, read by the others
+    // scores: content * scale + position term (column i - j - dmin), keys past the sequence masked
     float mx[2] = {m[0], m[1]};
 #pragma unroll
     for (int ni = 0; ni < 4; ++ni)
@@ -254,7 +264,10 @@ __global__ void __launch_bounds__(128, 2) relpos_attention_kernel(const AttnArgs
       for (int e = 0; e < 4; ++e) {
         const int half = e >> 1, r = warp * 16 + g + half * 8, j = j0 + ni * 8 + 2 * t + (e & 1);
         float v = -INFINITY;
-        if (j < len) v = s[ni][e] * p.scale + bf(sPD[r * p.pd_cols + (q0 + r - j - dmin)]);
+        if (j < len) {
+          const int c = q0 + r - j - dmin;
+          v = s[ni][e] * p.scale + bf(sP[r * RING_LD + (((c / ABN) & 3) * ABN) + (c % ABN)]);
+        }
         s[ni][e] = v;
         mx[half] = fmaxf(mx[half], v);
       }
@@ -267,15 +280,15 @@ __global__ void __launch_bounds__(128, 2) relpos_attention_kernel(const AttnArgs
       m[half] = mx[half];
     }
     float rs[2] = {0.f, 0.f};
-    uint32_t pa[2][4];
+    uint32_t pr[2][4];
 #pragma unroll
     for (int ni = 0; ni < 4; ++ni) {
       const float p0 = expf(s[ni][0] - m[0]), p1 = expf(s[ni][1] - m[0]);
       const float p2 = expf(s[ni][2] - m[1]), p3 = expf(s[ni][3] - m[1]);
       rs[0] += p0 + p1;
       rs[1] += p2 + p3;
-      pa[ni >> 1][(ni & 1) * 2] = pack_bf16(p0, p1);
-      pa[ni >> 1][(ni & 1) * 2 + 1] = pack_bf16(p2, p3);
+      pr[ni >> 1][(ni & 1) * 2] = pack_bf16(p0, p1);
+      pr[ni >> 1][(ni & 1) * 2 + 1] = pack_bf16(p2, p3);
     }
 #pragma unroll
     for (int half = 0; half < 2; ++half) {
@@ -300,8 +313,8 @@ __global__ void __launch_bounds__(128, 2) relpos_attention_kernel(const AttnArgs
         uint32_t b0, b1, b2, b3;
         ldmatrix_x4_trans(b0, b1, b2, b3,
                           sV + (kk * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * ADP + nj * 16 + (lane >> 4) * 8);
-        mma_bf16(o[2 * nj], pa[kk], b0, b1);
-        mma_bf16(o[2 * nj + 1], pa[kk], b2, b3);
+        mma_bf16(o[2 * nj], pr[kk], b0, b1);
+        mma_bf16(o[2 * nj + 1], pr[kk], b2, b3);
       }
     }
     __syncthreads();  // every warp is done with V(j)
@@ -335,15 +348,17 @@ __global__ void sub_conv0_dw_kernel(const __nv_bfloat16* __restrict__ feats, int
                                     const int2* __restrict__ rows, const float* __restrict__ w0,
                                     const float* __restrict__ b0, const float* __restrict__ w2,
                                     const float* __restrict__ b2, __nv_bfloat16* __restrict__ out, int F) {
-  constexpr int MELS = 128, F1 = 64, F2 = 32;
-  __shared__ float mel[7][MELS + 1];
+  constexpr int MELS = 128, F1 = 64, F2 = 32, PADL = 4, LDM = PADL + MELS + 4;
+  // rows zero-padded by 4 on both sides: a 9-tap sum reads its 3 x 3 window with float4 loads (a zero term adds
+  // nothing to the fp32 sum, so the padded taps change no value)
+  __shared__ __align__(16) float mel[7][LDM];
   const int2 rw = rows[blockIdx.x];  // (sequence, t2)
   const int seq = rw.x, t2 = rw.y, c = threadIdx.x, C = blockDim.x;
   const int L = mel_len[seq], T1 = (L - 1) / 2 + 1;
   const __nv_bfloat16* x = feats + (size_t)seq * ld_seq;
-  for (int i = threadIdx.x; i < 7 * MELS; i += C) {
-    const int r = 4 * t2 - 3 + i / MELS;
-    mel[i / MELS][i % MELS] = (r >= 0 && r < L) ? bf(x[(size_t)r * MELS + i % MELS]) : 0.f;
+  for (int i = threadIdx.x; i < 7 * LDM; i += C) {
+    const int r = 4 * t2 - 3 + i / LDM, m = i % LDM - PADL;
+    mel[i / LDM][i % LDM] = (r >= 0 && r < L && m >= 0 && m < MELS) ? bf(x[(size_t)r * MELS + m]) : 0.f;
   }
   __syncthreads();
   float wa[9], wd[9];
@@ -360,24 +375,36 @@ __global__ void sub_conv0_dw_kernel(const __nv_bfloat16* __restrict__ feats, int
   for (int r = 0; r < 3; ++r) {  // conv0 row t1 = 2 t2 - 1 + r feeds tap row r of the depthwise convolution
     const int t1 = 2 * t2 - 1 + r;
     if (t1 < 0 || t1 >= T1) continue;
-#pragma unroll 4
-    for (int f1 = 0; f1 < F1; ++f1) {
-      float v = 0.f;
+#pragma unroll
+    for (int fc = 0; fc < F1; fc += 8) {  // conv0 columns fc .. fc + 7 read mel columns 2 fc - 1 .. 2 fc + 15
+      float m[3][20];
 #pragma unroll
       for (int i = 0; i < 3; ++i)
 #pragma unroll
-        for (int j = 0; j < 3; ++j) {
-          const int fm = 2 * f1 - 1 + j;
-          if (fm >= 0) v += wa[i * 3 + j] * mel[2 * r + i][fm];
+        for (int q4 = 0; q4 < 5; ++q4) {
+          const float4 v4 = *reinterpret_cast<const float4*>(&mel[2 * r + i][PADL + 2 * fc - 4 + 4 * q4]);
+          m[i][4 * q4] = v4.x;
+          m[i][4 * q4 + 1] = v4.y;
+          m[i][4 * q4 + 2] = v4.z;
+          m[i][4 * q4 + 3] = v4.w;
         }
-      v = fmaxf(round_bf(round_bf(v) + ba), 0.f);
-      // depthwise output f2 reads conv0 column 2 f2 - 1 + j: f1 even -> (f2 = f1/2, j = 1); odd -> j = 0 and j = 2
-      if (f1 & 1) {
-        const int fa = (f1 + 1) / 2, fb = (f1 - 1) / 2;
-        if (fa < F2) acc[fa] += wd[r * 3 + 0] * v;
-        acc[fb] += wd[r * 3 + 2] * v;
-      } else {
-        acc[f1 / 2] += wd[r * 3 + 1] * v;
+#pragma unroll
+      for (int u = 0; u < 8; ++u) {
+        const int f1 = fc + u;
+        float v = 0.f;
+#pragma unroll
+        for (int i = 0; i < 3; ++i)
+#pragma unroll
+          for (int j = 0; j < 3; ++j) v = __fmaf_rn(wa[i * 3 + j], m[i][2 * u + 3 + j], v);  // column 2 f1 - 1 + j
+        v = fmaxf(round_bf(round_bf(v) + ba), 0.f);
+        // depthwise output f2 reads conv0 column 2 f2 - 1 + j: f1 even -> (f2 = f1/2, j = 1); odd -> j = 0 and j = 2
+        if (f1 & 1) {
+          const int fa = (f1 + 1) / 2, fb = (f1 - 1) / 2;
+          if (fa < F2) acc[fa] = __fmaf_rn(wd[r * 3 + 0], v, acc[fa]);
+          acc[fb] = __fmaf_rn(wd[r * 3 + 2], v, acc[fb]);
+        } else {
+          acc[f1 / 2] = __fmaf_rn(wd[r * 3 + 1], v, acc[f1 / 2]);
+        }
       }
     }
   }
@@ -424,6 +451,7 @@ __global__ void sub_dw_kernel(const __nv_bfloat16* __restrict__ x, const int* __
 // 32 frames x 64 channels per CTA: the 40 input frames it needs and the tile's weights staged in shared memory, each
 // thread then computes 8 channels of one frame
 constexpr int DW_T = 32, DW_C = 64;
+constexpr int DWQ_ROWS = 4;  // rows per CTA of dwconv_q8_kernel
 __global__ void __launch_bounds__(256) dwconv_tile_kernel(const __nv_bfloat16* __restrict__ x, const float* __restrict__ w,
                                                           const float* __restrict__ cb, const float* __restrict__ bn_scale,
                                                           const float* __restrict__ bn_shift,
@@ -524,6 +552,94 @@ void quantize_rows(const at::Tensor& x, at::Tensor& q, at::Tensor& s) {
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// int8 path: the depthwise convolution, BatchNorm and SiLU of whole rows, quantized at once for the next GEMM (one
+// scale per row, store_q8's arithmetic): a CTA of 160 threads holds 4 rows, each thread 8 channels with their 9 taps
+// in registers and the 12 input rows it needs loaded up front. The bf16 output dwconv_tile_kernel wrote and
+// quantize_rows read back is never stored (6,800 rows: 124 us against 180; more rows per CTA spill or serialize).
+__global__ void __launch_bounds__(160) dwconv_q8_kernel(const __nv_bfloat16* __restrict__ x, const float* __restrict__ w,
+                                                        const float* __restrict__ cb, const float* __restrict__ bn_scale,
+                                                        const float* __restrict__ bn_shift,
+                                                        const int* __restrict__ seq_lo, const int* __restrict__ seq_hi,
+                                                        int8_t* __restrict__ q, float* __restrict__ qs, int rows) {
+  constexpr int R = DWQ_ROWS, K = 9, PAD = 4, C = 1280, WARPS = 5;
+  __shared__ float red[WARPS][R];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, c = tid * 8, r0 = blockIdx.x * R;
+  uint4 in[R + K - 1];
+#pragma unroll
+  for (int i = 0; i < R + K - 1; ++i) {
+    const int gr = r0 - PAD + i;
+    in[i] = gr >= 0 && gr < rows ? __ldg(reinterpret_cast<const uint4*>(x + (size_t)gr * C + c)) : make_uint4(0, 0, 0, 0);
+  }
+  float wk[8][K], bias[8], sc[8], sh[8];
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+#pragma unroll
+    for (int k = 0; k < K; ++k) wk[j][k] = __ldg(w + (c + j) * K + k);
+    bias[j] = __ldg(cb + c + j);
+    sc[j] = __ldg(bn_scale + c + j);
+    sh[j] = __ldg(bn_shift + c + j);
+  }
+  uint4 out[R];
+  float mx[R];
+#pragma unroll
+  for (int r = 0; r < R; ++r) {
+    const int row = r0 + r;
+    mx[r] = 0.f;
+    out[r] = make_uint4(0, 0, 0, 0);
+    if (row >= rows) continue;
+    const int lo = seq_lo[row], hi = seq_hi[row];
+    float acc[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc[j] = bias[j];
+#pragma unroll
+    for (int k = 0; k < K; ++k) {
+      const int src = row + k - PAD;
+      if (src < lo || src >= hi) continue;
+      const __nv_bfloat16* e = reinterpret_cast<const __nv_bfloat16*>(&in[r + k]);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) acc[j] = __fmaf_rn(bf(e[j]), wk[j][k], acc[j]);
+    }
+    uint32_t o[4];
+#pragma unroll
+    for (int j = 0; j < 8; j += 2) {
+      float a = round_bf(acc[j]), b = round_bf(acc[j + 1]);
+      a = round_bf(__fmaf_rn(a, sc[j], sh[j]));
+      b = round_bf(__fmaf_rn(b, sc[j + 1], sh[j + 1]));
+      o[j / 2] = pack_bf16(a * sigmoidf_(a), b * sigmoidf_(b));
+    }
+    out[r] = make_uint4(o[0], o[1], o[2], o[3]);
+    const __nv_bfloat16* e = reinterpret_cast<const __nv_bfloat16*>(&out[r]);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) mx[r] = fmaxf(mx[r], fabsf(bf(e[j])));
+  }
+#pragma unroll
+  for (int r = 0; r < R; ++r) {
+    float m = mx[r];
+#pragma unroll
+    for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
+    if (lane == 0) red[warp][r] = m;
+  }
+  __syncthreads();
+#pragma unroll
+  for (int r = 0; r < R; ++r) {
+    const int row = r0 + r;
+    if (row >= rows) break;
+    float m = red[0][r];
+#pragma unroll
+    for (int k = 1; k < WARPS; ++k) m = fmaxf(m, red[k][r]);
+    const float sv = m > 0.f ? m / 127.f : 1.f, inv = 1.f / sv;
+    const __nv_bfloat16* e = reinterpret_cast<const __nv_bfloat16*>(&out[r]);
+    uint32_t v[2] = {0, 0};
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      const int qi = __float2int_rn(fminf(fmaxf(bf(e[k]) * inv, -127.f), 127.f));
+      v[k >> 2] |= (uint32_t)(qi & 0xff) << ((k & 3) * 8);
+    }
+    *reinterpret_cast<uint2*>(q + (size_t)row * C + c) = make_uint2(v[0], v[1]);
+    if (tid == 0) qs[row] = sv;
+  }
+}
+
 void dwconv_bn_silu(const at::Tensor& x, const at::Tensor& w, const at::Tensor& cb, const at::Tensor& bn_scale,
                     const at::Tensor& bn_shift, const at::Tensor& seq_lo, const at::Tensor& seq_hi, at::Tensor& y) {
   const int rows = x.size(0), C = x.size(1), K = w.size(1);
@@ -538,9 +654,25 @@ void dwconv_bn_silu(const at::Tensor& x, const at::Tensor& w, const at::Tensor& 
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// hq (rows, 1280) int8, hs (rows) = quantize_rows(dwconv_bn_silu(x)) without the bf16 intermediate
+void dwconv_bn_silu_q8(const at::Tensor& x, const at::Tensor& w, const at::Tensor& cb, const at::Tensor& bn_scale,
+                       const at::Tensor& bn_shift, const at::Tensor& seq_lo, const at::Tensor& seq_hi, at::Tensor& hq,
+                       at::Tensor& hs) {
+  const int rows = x.size(0);
+  TORCH_CHECK(x.is_contiguous() && x.size(1) == 1280 && w.size(1) == 9 && w.scalar_type() == at::kFloat &&
+              hq.is_contiguous() && hq.scalar_type() == at::kChar);
+  if (rows == 0) return;
+  const at::cuda::OptionalCUDAGuard guard(x.device());
+  dwconv_q8_kernel<<<(rows + DWQ_ROWS - 1) / DWQ_ROWS, 160, 0, at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), w.data_ptr<float>(), cb.data_ptr<float>(),
+      bn_scale.data_ptr<float>(), bn_shift.data_ptr<float>(), seq_lo.data_ptr<int>(), seq_hi.data_ptr<int>(),
+      hq.data_ptr<int8_t>(), hs.data_ptr<float>(), rows);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 // out (rows, H*160) = relative-position attention of qkv (rows, 3*H*160) per sequence; tiles (n, 4) int32 lists
 // (seq start, seq length, first query row, 0) for every 64-row query tile; rk the layer's distance table, row
-// d + rel_off for distance d; max_len the longest sequence (sizes the shared-memory position block).
+// d + rel_off for distance d; max_len the longest sequence (checked against the table).
 void relpos_attention(const at::Tensor& qkv, const at::Tensor& rk, const at::Tensor& bu, const at::Tensor& bv,
                       const at::Tensor& tiles, int64_t rel_off, int64_t max_len, double scale, at::Tensor& out) {
   TORCH_CHECK(qkv.is_contiguous() && out.is_contiguous() && rk.is_contiguous() && tiles.is_contiguous());
@@ -559,16 +691,14 @@ void relpos_attention(const at::Tensor& qkv, const at::Tensor& rk, const at::Ten
   p.rel_off = rel_off;
   p.rel_rows = rk.size(0);
   p.scale = scale;
-  // position block: 64 rows x (distances rounded up to whole 32-column chunks), padded by 8 columns
-  const int n_dist = ((max_len + ABM - 1 + ABN - 1) / ABN) * ABN;
-  p.pd_cols = n_dist + 8;
-  const int smem = (2 * ABN * ADP + ABM * p.pd_cols) * 2;
-  TORCH_CHECK(smem <= 99 * 1024, "relpos_attention: sequence too long for shared memory (", max_len, ")");
+  constexpr int smem = (3 * ABN * ADP + ABM * RING_LD) * 2;  // two CTAs an SM
+  TORCH_CHECK(max_len - 1 <= rel_off && rel_off + max_len + ABM - 2 < p.rel_rows,
+              "relpos_attention: sequence too long for the distance table (", max_len, ")");
   const at::cuda::OptionalCUDAGuard guard(qkv.device());
-  static int configured = 0;
-  if (smem > configured) {
-    cudaFuncSetAttribute(relpos_attention_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024);
-    configured = 99 * 1024;
+  static bool configured = false;
+  if (!configured) {
+    cudaFuncSetAttribute(relpos_attention_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    configured = true;
   }
   relpos_attention_kernel<<<dim3(n_tiles, H), 128, smem, at::cuda::getCurrentCUDAStream()>>>(p);
   C10_CUDA_KERNEL_LAUNCH_CHECK();

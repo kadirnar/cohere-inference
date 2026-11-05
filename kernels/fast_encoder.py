@@ -29,12 +29,32 @@ import torch
 import torch.nn.functional as F
 
 from kernels.cuda_ext import EPI_BIAS, EPI_CONV_RELU, EPI_GLU, ext
+from kernels.sparse import compress_24
 
 GEMM_CFG = 8  # 128 x 128 tiles, 4 warps, 3 stages: fastest on an A10 for the encoder's shapes
 # int8 configs (kernels/csrc/gemm_int8.cu), fastest on an A10: per-row A scales with 64 x 64 warp tiles, the grouped
-# K=5120 input with 64 x 32; the feed-forwards' first GEMM with 256-column tiles, so their int8 output (the second's
-# input) has one scale per row and 256 columns
-I8_CFG, I8_CFG_GROUPED, I8_CFG_FF1, FF_GROUP = 0, 3, 4, 256
+# K=5120 input with 32 x 64 ones in 128 x 128 tiles of 8 warps (at the 150 W cap; the 64 x 128 tiles of config 3 are
+# faster only until the card throttles); the feed-forwards' first GEMM with 256-column tiles, so their int8 output (the
+# second's input) has one scale per row and 256 columns
+I8_CFG, I8_CFG_GROUPED, I8_CFG_FF1, FF_GROUP = 0, 10, 4, 256
+# with few frames (a request or two) those tiles leave most SMs idle: 32 or 64-row tiles instead (configs 5-9, the same
+# sums: the output does not depend on the config). (up to frames, config) per GEMM, measured on an A10
+I8_SMALL = {"ff1": ((96, 6), (224, 8), (384, 4), (448, 8)),
+            "ff2": ((256, 5), (640, 9), (896, 3), (1152, 9)),
+            "qkv": ((192, 9), (256, 0), (320, 9)),
+            "pw1": ((320, 9), (384, 0), (448, 9)),
+            "o": ((640, 9), (896, 0), (1056, 9))}
+
+
+# FFN_SPARSE: the feed-forwards' second GEMM 2:4 sparse (kernels/csrc/gemm_sparse.cu), (up to frames, config)
+SP_CONFIGS = ((448, 2), (2048, 0), (1 << 30, 3))
+
+
+def i8_config(gemm: str, frames: int, default: int) -> int:
+    for up_to, cfg in I8_SMALL[gemm]:
+        if frames <= up_to:
+            return cfg
+    return default
 
 
 def quantize_rows(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -52,7 +72,7 @@ def gemm(a, w, b, epi=EPI_BIAS, out=None, resid=None, alpha=1.0, cfg=GEMM_CFG):
 
 
 class _Layer:
-    def __init__(self, blk, rk, int8: bool = False):
+    def __init__(self, blk, rk, int8: bool = False, sparse: bool = False):
         ln = lambda m: (m.weight, m.bias, m.eps)  # noqa: E731
         self.ln_ff1, self.ln_att, self.ln_conv = ln(blk.norm_feed_forward1), ln(blk.norm_self_att), ln(blk.norm_conv)
         self.ln_ff2, self.ln_out = ln(blk.norm_feed_forward2), ln(blk.norm_out)
@@ -84,6 +104,12 @@ class _Layer:
             self.q_qkv, self.q_pw1 = quantize_rows(self.wqkv), quantize_rows(self.wpw1)
             self.q_o, self.q_pw2 = quantize_rows(self.wo), quantize_rows(self.wpw2)
             gone = torch.empty(0, device=self.wo.device, dtype=self.wo.dtype)
+            gone8 = torch.empty(0, device=self.wo.device, dtype=torch.int8)
+            self.sp = (gone8, gone8.int(), gone8, gone8.int())
+            if sparse:  # the second GEMMs' int8 weights (pruned 2:4 before quantization) compressed, the dense freed
+                self.sp = (*compress_24(self.q_ff1[1][0]), *compress_24(self.q_ff2[1][0]))
+                self.q_ff1 = (self.q_ff1[0], (gone8, self.q_ff1[1][1]))
+                self.q_ff2 = (self.q_ff2[0], (gone8, self.q_ff2[1][1]))
             self.ff1 = (gone, self.ff1[1], gone, self.ff1[3])
             self.ff2 = (gone, self.ff2[1], gone, self.ff2[3])
             self.wqkv = self.wpw1 = self.wo = self.wpw2 = gone
@@ -100,15 +126,28 @@ class _Layer:
         if int8:
             for q in (*self.q_ff1, *self.q_ff2, self.q_qkv, self.q_pw1, self.q_o, self.q_pw2):
                 out += list(q)
+            out += list(self.sp)
         return out
 
 
 class FastEncoder:
     MAX_LEN = 512  # encoder frames (41 s of audio): the distance table covers -(MAX_LEN-1) .. MAX_LEN-1+64
 
-    def __init__(self, encoder, int8: bool = False):
+    def __init__(self, encoder, int8: bool = False, sparse: str | None = None):
         """int8: W8A8 for every GEMM of the layers; weights per output channel, activations per row (the
-        feed-forwards' second GEMM: per row and 256 columns)."""
+        feed-forwards' second GEMM: per row and 256 columns). sparse (with int8): a file of 2:4-pruned weights of the
+        feed-forwards' second linear layers (kernels/sparse.py), put into the model and run by the sparse GEMM."""
+        assert sparse is None or int8, "FFN_SPARSE needs INT8"
+        self.sparse = sparse is not None
+        if sparse:
+            pruned = torch.load(sparse)
+            with torch.no_grad():
+                for key, w in pruned.items():
+                    i, name = key.split(".")
+                    lin = getattr(encoder.layers[int(i)], name).linear2
+                    assert w.shape == lin.weight.shape, key
+                    lin.weight.copy_(w.to(lin.weight.device, lin.weight.dtype))
+            assert len(pruned) == 2 * len(encoder.layers), "the file prunes every feed-forward's second layer"
         cfg = encoder.config
         self.int8 = int8
         assert cfg.hidden_size == 1280 and cfg.num_attention_heads == 8 and not cfg.scale_input
@@ -122,8 +161,8 @@ class FastEncoder:
         freqs = d[:, None] * encoder.encode_positions.inv_freq.to(p.device, torch.float)
         pos = torch.stack([freqs.sin(), freqs.cos()], -1).reshape(len(d), -1).to(p.dtype)
         with torch.no_grad():
-            self.layers = [_Layer(blk, F.linear(pos, blk.self_attn.relative_k_proj.weight).contiguous(), int8)
-                           for blk in encoder.layers]
+            self.layers = [_Layer(blk, F.linear(pos, blk.self_attn.relative_k_proj.weight).contiguous(), int8,
+                                  self.sparse) for blk in encoder.layers]
             # subsampling: [conv0, ReLU, dw, pw, ReLU, dw, pw, ReLU] + linear; the linear's input columns reordered
             # from (channel, frequency) to the channels-last (frequency, channel)
             sub = encoder.subsampling
@@ -177,9 +216,12 @@ class FastEncoder:
     def layers_forward(self, x: torch.Tensor, meta: dict) -> torch.Tensor:
         """The 48 layers on packed frames x (N, 1280), in place (kernels/csrc/encoder_loop.cpp); returns x."""
         assert meta["max_len"] <= self.MAX_LEN
+        n = x.shape[0]
         ext.encoder_layers(x, self.layer_tensors, self.layer_eps, meta["tiles"], meta["lo"], meta["hi"], self.rel_off,
                            meta["max_len"], self.scale, self.int8,
-                           [GEMM_CFG, I8_CFG, I8_CFG_GROUPED, I8_CFG_FF1, FF_GROUP])
+                           [GEMM_CFG, i8_config("qkv", n, I8_CFG), i8_config("ff2", n, I8_CFG_GROUPED),
+                            i8_config("ff1", n, I8_CFG_FF1), FF_GROUP, i8_config("pw1", n, I8_CFG),
+                            i8_config("o", n, I8_CFG), next(c for up_to, c in SP_CONFIGS if n <= up_to)])
         return x
 
     @torch.no_grad()

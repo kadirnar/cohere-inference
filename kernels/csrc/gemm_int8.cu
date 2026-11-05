@@ -5,6 +5,9 @@
 // scale per output channel (sw[n]). The pipeline is the bf16 kernel's (gemm.cu) with the same byte layout: a BK = 64
 // int8 tile row is 64 bytes, so the swizzle and the ldmatrix addresses are the same; the warps multiply with
 // mma.sync m16n8k32 s8 (int32 accumulation, exact), converted to fp32 with the row's scale at the end of each K-group.
+// Few rows (a request or two: M of a few hundred frames) leave most of the 72 SMs idle with 128-row tiles, each CTA
+// bound by its own tile's arithmetic; configs 5-9 have 32 or 64-row tiles for them (the same sums in the same order:
+// a clip's output does not depend on what it is batched with).
 // Epilogues (value v = acc * sa * sw + bias, rounded to bf16 where the bf16 module rounds):
 //   EPI_BIAS      bf16 y = v
 //   EPI_GLU       bf16 y[:, j] = a * sigmoid(g) of interleaved columns (2j, 2j+1)
@@ -151,8 +154,8 @@ __global__ void __launch_bounds__(WM* WN * 32) gemm_i8_kernel(const I8Args p) {
 #pragma unroll
         for (int ni = 0; ni < NI; ++ni) {
           if constexpr (GROUPED) {
-            accf[mi][ni][half * 2] += i2f_small(acc[mi][ni][half * 2]) * s;
-            accf[mi][ni][half * 2 + 1] += i2f_small(acc[mi][ni][half * 2 + 1]) * s;
+            accf[mi][ni][half * 2] = __fmaf_rn(i2f_small(acc[mi][ni][half * 2]), s, accf[mi][ni][half * 2]);
+            accf[mi][ni][half * 2 + 1] = __fmaf_rn(i2f_small(acc[mi][ni][half * 2 + 1]), s, accf[mi][ni][half * 2 + 1]);
           }
           acc[mi][ni][half * 2] = acc[mi][ni][half * 2 + 1] = 0;
         }
@@ -210,18 +213,23 @@ __global__ void __launch_bounds__(WM* WN * 32) gemm_i8_kernel(const I8Args p) {
       for (int ni = 0; ni < NI; ++ni) {
         const int c = wn * TN + ni * 8 + 2 * t;
         const float2 w2 = *reinterpret_cast<const float2*>(p.sw + n0 + c);
-        float v0, v1;
+        // explicit roundings (the bias added in the product's FMA): every config computes the same values
+        float x0, x1;
         if constexpr (GROUPED) {
-          v0 = accf[mi][ni][half * 2] * w2.x;
-          v1 = accf[mi][ni][half * 2 + 1] * w2.y;
+          x0 = accf[mi][ni][half * 2];
+          x1 = accf[mi][ni][half * 2 + 1];
         } else {
-          v0 = (float)acc[mi][ni][half * 2] * srow * w2.x;
-          v1 = (float)acc[mi][ni][half * 2 + 1] * srow * w2.y;
+          x0 = __fmul_rn((float)acc[mi][ni][half * 2], srow);
+          x1 = __fmul_rn((float)acc[mi][ni][half * 2 + 1], srow);
         }
+        float v0, v1;
         if (p.bias) {
           const __nv_bfloat162 bb = *reinterpret_cast<const __nv_bfloat162*>(p.bias + n0 + c);
-          v0 += __low2float(bb);
-          v1 += __high2float(bb);
+          v0 = __fmaf_rn(x0, w2.x, __low2float(bb));
+          v1 = __fmaf_rn(x1, w2.y, __high2float(bb));
+        } else {
+          v0 = __fmul_rn(x0, w2.x);
+          v1 = __fmul_rn(x1, w2.y);
         }
         if constexpr (EPI == EPI_GLU) {
           sC[r * LDS + (c >> 1)] = tobf(round_bf(v0) * fast_sigmoid(round_bf(v1)));
@@ -271,8 +279,8 @@ __global__ void __launch_bounds__(WM* WN * 32) gemm_i8_kernel(const I8Args p) {
         uint32_t o[4];
 #pragma unroll
         for (int k = 0; k < 4; ++k)
-          o[k] = pack_bf16(__low2float(r2[k]) + p.alpha * __low2float(y2[k]),
-                           __high2float(r2[k]) + p.alpha * __high2float(y2[k]));
+          o[k] = pack_bf16(__fmaf_rn(p.alpha, __low2float(y2[k]), __low2float(r2[k])),
+                           __fmaf_rn(p.alpha, __high2float(y2[k]), __high2float(r2[k])));
         v = make_uint4(o[0], o[1], o[2], o[3]);
       }
       *reinterpret_cast<uint4*>(reinterpret_cast<__nv_bfloat16*>(p.C) + (size_t)row * p.ldc + out_col0 + c) = v;
@@ -316,6 +324,18 @@ void dispatch(int cfg, const I8Args& p, cudaStream_t s) {
     case 0: launch<128, 128, 2, 2, 3, EPI>(p, s); break;  // warp tile 64 x 64: per-row A scales
     case 1: launch<128, 128, 2, 4, 3, EPI>(p, s); break;  // warp tile 64 x 32
     case 3: launch<64, 128, 2, 2, 4, EPI>(p, s); break;   // warp tile 32 x 64: grouped A scales
+    case 5: launch<32, 64, 1, 2, 4, EPI>(p, s); break;    // warp tile 32 x 32: few rows (grouped too)
+    case 6:                                               // the feed-forwards' first GEMM, few rows
+      if constexpr (valid<EPI, 256>()) launch<32, 256, 1, 4, 3, EPI>(p, s);
+      else TORCH_CHECK(false, "gemm_i8: config 6 has 256-column tiles");
+      break;
+    case 7: launch<32, 128, 1, 4, 4, EPI>(p, s); break;   // warp tile 32 x 32: few rows
+    case 8:
+      if constexpr (valid<EPI, 256>()) launch<32, 256, 1, 4, 2, EPI>(p, s);
+      else TORCH_CHECK(false, "gemm_i8: config 8 has 256-column tiles");
+      break;
+    case 9: launch<64, 64, 2, 2, 4, EPI>(p, s); break;    // warp tile 32 x 32
+    case 10: launch<128, 128, 4, 2, 3, EPI>(p, s); break;  // warp tile 32 x 64, 8 warps: grouped A scales, many rows
     case 4:                                               // 256-column tiles: the feed-forwards' first GEMM
       if constexpr (valid<EPI, 256>()) launch<128, 256, 2, 4, 3, EPI>(p, s);
       else TORCH_CHECK(false, "gemm_i8: config 4 has 256-column tiles");

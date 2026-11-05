@@ -50,19 +50,33 @@ void encoder_layers(at::Tensor& x, const std::vector<std::vector<at::Tensor>>& l
 
 void quantize_rows(const at::Tensor& x, at::Tensor& q, at::Tensor& s);
 
+void logmel_features(const at::Tensor& x, const at::Tensor& meta, int64_t total_frames, const at::Tensor& window,
+                     const at::Tensor& mel, const at::Tensor& band, double preemph, at::Tensor& out);
+
+void dwconv_bn_silu_q8(const at::Tensor& x, const at::Tensor& w, const at::Tensor& cb, const at::Tensor& bn_scale,
+                       const at::Tensor& bn_shift, const at::Tensor& seq_lo, const at::Tensor& seq_hi, at::Tensor& hq,
+                       at::Tensor& hs);
+
+void gemm_sp(const at::Tensor& x, const at::Tensor& sx, int64_t group, const at::Tensor& wc, const at::Tensor& e,
+             const at::Tensor& sw, const c10::optional<at::Tensor>& bias, const at::Tensor& r, at::Tensor& out,
+             double alpha, int64_t cfg);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gemm", &gemm, "bf16 GEMM with fused epilogue: out = epi(a @ w^T + bias)");
   m.def("encoder_layers", &encoder_layers, "the encoder's layers on packed frames, launched from C++");
   m.def("gemm_i8", &gemm_i8, "int8 GEMM (W8A8) with fused dequantization and epilogue");
+  m.def("gemm_sp", &gemm_sp, "2:4 sparse int8 GEMM with grouped X scales and the residual epilogue");
   m.def("quantize_rows", &quantize_rows, "bf16 rows (1280) to int8 with per-row scales");
   m.def("layernorm_q8", &layernorm_q8, "LayerNorm(s) with int8 output and per-row scale");
   m.def("sub_conv0_dw", &sub_conv0_dw, "subsampling: conv0 + ReLU + depthwise, per sequence, channels-last");
   m.def("sub_dw", &sub_dw, "subsampling: depthwise 3x3 stride 2 per sequence, channels-last");
   m.def("layernorm", &layernorm, "h = LN(x), or x = LN1(x) and h = LN2(x)");
   m.def("dwconv_bn_silu", &dwconv_bn_silu, "depthwise conv + BatchNorm + SiLU per packed sequence");
+  m.def("dwconv_bn_silu_q8", &dwconv_bn_silu_q8, "dwconv_bn_silu, quantized per row (int8 GEMM input)");
   m.def("dec_w8_linear", &dec_w8_linear, "decoder projection with int8 weights (W8A16), split-K");
   m.def("dec_embed", &dec_embed, "decoder step: embedding + LayerNorms per active slot");
   m.def("dec_add_ln", &dec_add_ln, "x += y; h = LN(x)");
+  m.def("logmel_features", &logmel_features, "normalized log-mel features of packed pieces, valid frames only");
   m.def("dec_attention", &dec_attention, "decoder self/cross attention of one token per active slot");
   m.def("dec_attention_q8", &dec_attention_q8, "decoder self/cross attention over int8 caches");
   m.def("dec_scatter_kv_q8", &dec_scatter_kv_q8, "cross-attention keys/values into int8 slots with scales");

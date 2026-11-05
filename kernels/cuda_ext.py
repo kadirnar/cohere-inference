@@ -9,7 +9,8 @@ import torch
 from torch.utils.cpp_extension import load
 
 _DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc")
-_SOURCES = ["bindings.cpp", "encoder_loop.cpp", "gemm.cu", "gemm_int8.cu", "encoder_ops.cu", "decoder_ops.cu", "dec_w8.cu"]
+_SOURCES = ["bindings.cpp", "encoder_loop.cpp", "gemm.cu", "gemm_int8.cu", "encoder_ops.cu", "decoder_ops.cu", "dec_w8.cu",
+            "features.cu", "gemm_sparse.cu"]
 
 
 def _build():

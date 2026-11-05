@@ -87,6 +87,9 @@ SLOTS = int(os.environ.get("SLOTS", "128"))  # pieces decoded at once (more wait
 # On FLEURS ar_eg / en_us with the base model the WER was unchanged (6.91 -> 6.88 %, 6.39 -> 6.33 %) and 93-94 % of
 # transcripts identical to bf16's; INT8=0 keeps the model's own bf16 arithmetic.
 INT8 = os.environ.get("INT8", "1") != "0"
+# FFN_SPARSE (INT8, opt-in): a file of 2:4-pruned weights of the encoder feed-forwards' second linear layers, made for
+# this model by `python -m kernels.sparse` (kernels/sparse.py): the encoder ~3.5 % faster for ~0.1-0.5 points of WER
+FFN_SPARSE = os.environ.get("FFN_SPARSE") or None
 # With FAST, WORKERS HTTP worker processes (default 8) parse the requests, decode and level the audio and write the text,
 # and one GPU process (this file with --gpu) runs the model for all of them over a local socket: in one process the
 # HTTP loop, the request threads and the threads launching the GPU work slowed each other down through the GIL.
@@ -267,7 +270,7 @@ class Engine(Text):
             from kernels.pipeline import Pipeline
 
             self.pipe = Pipeline(self.model, self.processor.feature_extractor, slots=SLOTS,
-                                 max_new_tokens=MAX_NEW_TOKENS, int8=INT8)
+                                 max_new_tokens=MAX_NEW_TOKENS, int8=INT8, sparse=FFN_SPARSE)
         from kernels.silero_parallel import ParallelSilero
 
         self.vad = ParallelSilero("cuda")  # Silero's own probabilities and regions, the network run in parallel
@@ -558,19 +561,114 @@ app = FastAPI(title="Cohere-AR sft-v9-full-s86k speech-to-text", version=REVISIO
 
 class LimitSize:
     """413 for a declared body over MAX_MB before it is read, and the request's arrival time for the log. Plain ASGI:
-    FastAPI's @app.middleware("http") (BaseHTTPMiddleware) doubled the time 100 simultaneous uploads took."""
+    FastAPI's @app.middleware("http") (BaseHTTPMiddleware) doubled the time 100 simultaneous uploads took. In an HTTP
+    worker, POST /transcribe is answered here when its form is a plain one (fast_form): FastAPI's form parsing,
+    validation and response encoding took ~5 ms of the worker's event loop per request, which a burst's requests
+    queued for."""
 
     def __init__(self, app):
         self.app = app
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
-            n = dict(scope["headers"]).get(b"content-length", b"")
+            headers = dict(scope["headers"])
+            n = headers.get(b"content-length", b"")
             if n.isdigit() and int(n) > MAX_MB * 1e6 + 1e5:
                 await JSONResponse({"detail": f"file too large (max {MAX_MB:g} MB)"}, status_code=413)(scope, receive, send)
                 return
             scope.setdefault("state", {})["arrived"] = time.time()  # before the body is read and parsed
+            ctype = headers.get(b"content-type", b"")
+            if remote and scope["method"] == "POST" and scope["path"] == "/transcribe" and ctype.startswith(
+                    b"multipart/form-data"):
+                await self.transcribe(scope, receive, send, ctype)
+                return
         await self.app(scope, receive, send)
+
+    async def transcribe(self, scope, receive, send, ctype: bytes):
+        chunks, size = [], 0
+        while True:
+            message = await receive()
+            if message["type"] != "http.request":
+                return  # the client went away
+            chunks.append(message.get("body", b""))
+            size += len(chunks[-1])
+            if size > MAX_MB * 1e6 + 1e5:
+                await JSONResponse({"detail": f"file too large (max {MAX_MB:g} MB)"}, status_code=413)(scope, receive, send)
+                return
+            if not message.get("more_body", False):
+                break
+        body = b"".join(chunks)
+        form = fast_form(body, ctype)
+        if form is None:  # anything unusual: FastAPI parses and validates it as before
+            replayed = False
+
+            async def again():
+                nonlocal replayed
+                if replayed:
+                    return await receive()
+                replayed = True
+                return {"type": "http.request", "body": body, "more_body": False}
+
+            await self.app(scope, again, send)
+            return
+        try:
+            response = JSONResponse(await transcribe_data(form["file"], form["language"], form["punctuation"],
+                                                          form["level"], form["reference"], scope["state"]["arrived"]))
+        except HTTPException as e:
+            response = JSONResponse({"detail": e.detail}, status_code=e.status_code, headers=e.headers)
+        await response(scope, receive, send)
+
+
+FORM_BOOL = {"1": True, "on": True, "t": True, "true": True, "y": True, "yes": True,
+             "0": False, "off": False, "f": False, "false": False, "n": False, "no": False}  # pydantic's
+FORM_NAME = re.compile(rb'(?i)^content-disposition:\s*form-data;\s*name="([^"]*)"(;\s*filename="([^"]*)")?\s*$')
+
+
+def fast_form(body: bytes, ctype: bytes) -> dict | None:
+    """The fields of a /transcribe multipart body (file bytes; language, punctuation, level, reference with
+    /transcribe's defaults), or None for any form FastAPI should parse and validate itself (another layout, a field
+    twice, an empty or unparsed value, a file field without a filename)."""
+    m = re.search(rb'boundary="?([^";\s]+)"?', ctype)
+    if not m:
+        return None
+    parts = body.split(b"--" + m.group(1))
+    if len(parts) < 3 or parts[0] not in (b"", b"\r\n") or not parts[-1].startswith(b"--"):
+        return None
+    form: dict = {}
+    for part in parts[1:-1]:
+        head, sep, value = part.partition(b"\r\n\r\n")
+        if not sep or not head.startswith(b"\r\n") or not value.endswith(b"\r\n"):
+            return None
+        name = filename = None
+        for line in head[2:].split(b"\r\n"):
+            d = FORM_NAME.match(line)
+            if d:
+                name, filename = d.group(1).decode(), d.group(3)
+            elif not line.lower().startswith(b"content-type:"):
+                return None
+        if name is None or name in form:
+            return None
+        value = value[:-2]
+        if name == "file":
+            if not filename:
+                return None
+            form["file"] = value
+        elif name in ("language", "punctuation", "level", "reference"):
+            try:
+                text_value = value.decode()
+            except UnicodeDecodeError:
+                return None
+            if not text_value:
+                return None
+            if name in ("punctuation", "level"):
+                if text_value.lower() not in FORM_BOOL:
+                    return None
+                form[name] = FORM_BOOL[text_value.lower()]
+            else:
+                form[name] = text_value
+    if "file" not in form:
+        return None
+    return {"language": "auto", "punctuation": True, "level": True, "reference": "", **form}
 
 
 app.add_middleware(LimitSize)
@@ -578,13 +676,20 @@ app.add_middleware(LimitSize)
 
 async def run(request: Request, file: UploadFile, language: str, punctuation: bool, level: bool = True,
               reference: str = "") -> dict:
+    if language not in LANGUAGES:
+        raise HTTPException(400, f"language must be one of: {', '.join(LANGUAGES)}")
+    arrived = getattr(request.state, "arrived", time.time())
+    data = await file.read()
+    await file.close()
+    return await transcribe_data(data, language, punctuation, level, reference, arrived)
+
+
+async def transcribe_data(data: bytes, language: str, punctuation: bool, level: bool, reference: str,
+                          arrived: float) -> dict:
     global waiting
     if language not in LANGUAGES:
         raise HTTPException(400, f"language must be one of: {', '.join(LANGUAGES)}")
     t0 = time.time()
-    arrived = getattr(request.state, "arrived", t0)
-    data = await file.read()
-    await file.close()
     if not data:
         raise HTTPException(400, "empty file")
     if len(data) > MAX_MB * 1e6:
@@ -597,9 +702,15 @@ async def run(request: Request, file: UploadFile, language: str, punctuation: bo
     try:
         try:
             if remote:
-                x, mono = await asyncio.to_thread(load_mono, data, level)
+                if inline(data):  # a few ms of work: in a thread it waited its turn for the GIL with the others'
+                    x, mono = load_mono(data, level)
+                else:
+                    x, mono = await asyncio.to_thread(load_mono, data, level)
                 spans = [(0, len(mono))] if len(mono) <= WHOLE_S * SR else await remote.call("pieces", mono)
-                feats = await asyncio.to_thread(lambda: [dither(mono[s:e]) for s, e in spans])
+                if len(spans) == 1 and inline(data):
+                    feats = [dither(mono)]
+                else:
+                    feats = await asyncio.to_thread(lambda: [dither(mono[s:e]) for s, e in spans])
             else:
                 x, spans, feats = await asyncio.to_thread(load_and_prepare, data, level)
         except AudioTooLong as e:
@@ -611,13 +722,26 @@ async def run(request: Request, file: UploadFile, language: str, punctuation: bo
         t1 = time.time()
         if remote:
             tokens = await remote.call("decode", feats, language, punctuation) if feats else []
-            segs = segments(spans, await asyncio.to_thread(text.texts, tokens, language) if tokens else [])
+            if not tokens:
+                segs = segments(spans, [])
+            elif inline(data) and len(spans) == 1:
+                segs = segments(spans, text.texts(tokens, language))
+            else:
+                segs = segments(spans, await asyncio.to_thread(text.texts, tokens, language))
         else:
             segs = segments(spans, await batcher.submit(feats, language, punctuation))
     finally:
         waiting -= 1
     t2 = time.time()
+    if remote and inline(data) and len(segs) == 1 and not reference.strip():
+        return respond(segs, x, data, language, level, reference, arrived, t0, t1, t2)
     return await asyncio.to_thread(respond, segs, x, data, language, level, reference, arrived, t0, t1, t2)
+
+
+def inline(data: bytes) -> bool:
+    """An upload an HTTP worker prepares on its event loop: under 1.5 MB (45 s of 16-bit 16 kHz mono) in a format
+    libsndfile reads (no ffmpeg run). Six requests of a worker in threads took ~40 ms to get through their 3 ms each."""
+    return len(data) <= 1_500_000 and data[:4] in (b"RIFF", b"fLaC", b"OggS")
 
 
 def load_checked(data: bytes) -> np.ndarray:
@@ -661,8 +785,8 @@ def respond(segs: list[dict], x: np.ndarray, data: bytes, language: str, level: 
         s["normalized_text"] = textnorm.normalize(s["text"], s["language"] if s["language"] in ("ar", "en") else None)
         if s["text"]:
             seconds[s["language"]] = seconds.get(s["language"], 0) + s["end"] - s["start"]
-    log.info("transcribed audio_s=%.1f bytes=%d channels=%d language=%s level=%s pieces=%d upload_s=%.2f prep_s=%.2f "
-             "queue_gpu_s=%.2f total_s=%.2f", duration, len(data), x.shape[1], language, level, len(segs), t0 - arrived,
+    log.info("transcribed audio_s=%.1f bytes=%d channels=%d language=%s level=%s pieces=%d upload_s=%.3f prep_s=%.3f "
+             "queue_gpu_s=%.3f total_s=%.3f", duration, len(data), x.shape[1], language, level, len(segs), t0 - arrived,
              t1 - t0, t2 - t1, t2 - arrived)
     text = " ".join(s["text"] for s in segs if s["text"])
     out = {"model": MODEL_ID, "revision": REVISION,

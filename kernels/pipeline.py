@@ -3,7 +3,8 @@
 Two threads own the GPU, each with its own CUDA stream:
 
   encoder thread   takes the waiting pieces, shortest first, up to CHUNK_FRAMES encoder frames and as many as there are
-                   free decoder slots; computes their features (kernels/features.py), runs the packed encoder
+                   free decoder slots (their samples were copied to the GPU as they arrived); computes their
+                   features (kernels/features.py), runs the packed encoder
                    (kernels/fast_encoder.py) and writes their cross-attention keys and values into the slots; then
                    hands the chunk to the decoder thread and starts the next one
   decoder thread   runs decoding steps (kernels/stream_decoder.py) over every admitted piece: a chunk joins the batch as
@@ -51,6 +52,8 @@ class _Piece:
     job: _Job
     k: int
     samples: np.ndarray  # dithered
+    gpu: torch.Tensor  # the same on the GPU, copied on arrival (upload stream) ...
+    uploaded: torch.cuda.Event  # ... done when this event is
     prompt: torch.Tensor
     seq: int  # arrival order
     max_new: int | None = None
@@ -63,11 +66,13 @@ class Pipeline:
     MAX_WAIT_S = 0.75  # pieces waiting longer go first, whatever their length
     LAG = 1
 
-    def __init__(self, model, extractor, slots: int = 128, max_new_tokens: int = 448, int8: bool = False):
+    def __init__(self, model, extractor, slots: int = 128, max_new_tokens: int = 448, int8: bool = False,
+                 sparse: str | None = None):
         self.features = Features(extractor)
-        self.encoder = FastEncoder(model.model.encoder, int8=int8)
+        self.encoder = FastEncoder(model.model.encoder, int8=int8, sparse=sparse)
         self.decoder = StreamDecoder(model, slots=slots, max_new_tokens=max_new_tokens, int8=int8)
         self.enc_stream = torch.cuda.Stream()
+        self.up_stream = torch.cuda.Stream()  # the pieces' samples to the GPU as they arrive, off the encoder's path
         self.lock = threading.Condition()
         self.waiting: list[_Piece] = []
         self.free = list(range(slots))[::-1]
@@ -95,9 +100,16 @@ class Pipeline:
         if not pieces:
             job.future.set_result([])
             return job.future
+        with torch.cuda.stream(self.up_stream):
+            dev = self.decoder.device
+            gpu = [torch.from_numpy(np.ascontiguousarray(x, dtype=np.float32)).to(dev, non_blocking=True)
+                   for x in pieces]
+            uploaded = torch.cuda.Event()
+            uploaded.record(self.up_stream)
         with self.lock:
             for k, x in enumerate(pieces):
-                self.waiting.append(_Piece(job, k, x, prompt, self.seq, max_new[k] if max_new else None))
+                limit = max_new[k] if max_new else None
+                self.waiting.append(_Piece(job, k, x, gpu[k], uploaded, prompt, self.seq, limit))
                 self.seq += 1
             self.lock.notify_all()
         return job.future
@@ -142,7 +154,9 @@ class Pipeline:
                 self.trace.append((started, "encode", len(chunk), len(self.free)))
             try:
                 with torch.cuda.stream(self.enc_stream):
-                    feats, frames = self.features([p.samples for p in chunk])
+                    for ev in {id(p.uploaded): p.uploaded for p in chunk}.values():
+                        self.enc_stream.wait_event(ev)
+                    feats, frames = self.features([p.gpu for p in chunk])
                     hidden, lengths = self.encoder(feats, frames)
                     self.decoder.fill_cross(hidden, lengths, slots)
                     done = torch.cuda.Event()

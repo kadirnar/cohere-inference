@@ -88,18 +88,25 @@ first start; `FAST=0` runs transformers' own code instead), scheduled for many s
 - **Processes.** One GPU process (`server.py --gpu`, started by `server.py`) holds the model; `WORKERS` HTTP worker
   processes (default 8) parse the uploads, decode and level the audio, add the feature extractor's deterministic
   dither and turn token ids into text, and talk to the GPU process over a local socket. In one process the event
-  loop, the request threads and the threads launching GPU work held each other up through the GIL.
-- **Features** (`kernels/features.py`): the log-mel frames of a whole batch of pieces on the GPU (cuFFT and a few
-  kernels); 0.06 % of the bf16 values differ from the CPU extractor's, by one unit in the last place.
+  loop, the request threads and the threads launching GPU work held each other up through the GIL. A worker answers
+  `POST /transcribe` in plain ASGI (its own multipart parsing, FastAPI only for unusual forms) and prepares uploads
+  under 1.5 MB on its event loop: FastAPI's form handling and thread hand-offs had a burst's requests queue there.
+- **Features** (`kernels/features.py`, `features.cu`): the pieces' samples go to the GPU as they arrive; the log-mel
+  frames of a whole chunk are computed on its valid frames only (3 kernels and cuFFT); 0.07 % of the bf16 values
+  differ from the CPU extractor's, by one unit in the last place.
 - **Encoder** (FastConformer, 48 layers, 1.9 B parameters, `kernels/fast_encoder.py`). The pieces' frames are packed
   (no padding at all) and each layer is 14 kernels launched from C++ (`encoder_loop.cpp`): GEMMs with their epilogues
   fused (bias, SiLU, GLU, residual sum; `gemm.cu`, a cp.async / ldmatrix / mma.sync kernel that matches cuBLAS's speed
   and bits), LayerNorm (`encoder_ops.cu`), a relative-position flash attention whose position term is computed from a
-  per-layer table of projected distances inside the kernel (no (T, 2T) score tensor), the convolution module's
-  depthwise convolution with BatchNorm and SiLU, and the subsampling convolutions per piece, channels-last (the first
-  convolution and the depthwise one after it in one kernel). With `INT8` (default) every GEMM is int8 (W8A8:
+  per-layer table of projected distances inside the kernel, 32 distances at a time as the key tiles need them (no
+  (T, 2T) score tensor, and the same shared memory for any length: two CTAs an SM), the convolution module's
+  depthwise convolution with BatchNorm and SiLU (with `INT8` quantized for the next GEMM in the same kernel), and the
+  subsampling convolutions per piece, channels-last (the first convolution and the depthwise one after it in one
+  kernel). With `INT8` (default) every GEMM is int8 (W8A8:
   `gemm_int8.cu`, weights per output channel, activations per row, quantized by the kernel that produces them; on the
-  A10's 150 W cap int8 tensor cores do about 1.4x the bf16 work).
+  A10's 150 W cap int8 tensor cores do about 1.4x the bf16 work, 110-117 TOPS sustained). With few frames (a request
+  or two) the GEMMs use 32 or 64-row tiles (`fast_encoder.I8_SMALL`): the same sums, so a clip's encoding does not
+  depend on what it is batched with; one clip's encoder 17 -> 12.9 ms, 50 clips (6,808 frames) 291 -> 277 ms.
 - **Decoder** (8 layers, `kernels/stream_decoder.py`, `decoder_ops.cu`): continuous batching over 128 slots. A piece
   joins the batch as soon as its encoder chunk is done (its cross-attention keys and values written into its slot)
   and leaves it at its end-of-text token, when its request is answered; one CUDA graph per bucket of row counts runs a
@@ -125,7 +132,7 @@ architecture) because the s86k weights were not on the machine:
 |---|---|---|---|
 | before | 1.66-1.94 s | 2.97-3.01 s | 377 |
 | now, `INT8=0` (bf16 arithmetic) | 0.88-1.01 s | 1.41-1.50 s | 770 |
-| now, `INT8=1` (default) | 0.63-0.74 s | 0.99-1.05 s | 1,110 |
+| now, `INT8=1` (default) | 0.68-0.76 s | 0.94-0.97 s | 1,150-1,200 |
 
 So 100 requests are all answered within about a second: 10 ms of GPU time per request. Under steady load
 (`--sustain 30`: 100 clients, each sending its next clip as soon as the last is answered) the service answers 116
@@ -145,7 +152,27 @@ streamed). A persistent kernel running the whole step (one CTA per SM, grid barr
 the weights streamed ahead through cp.async) was tried and came out slower, 0.73 ms for one row and 1.47 ms for 32:
 every phase keeps a chain of dependent latencies (barrier, the activations from L2, the cross-warp sum), and shared
 memory holds too few weight units ahead to keep the memory busy through the short phases. One request at a time (HTTP, FLEURS clips, median):
-65 ms under 8 s of audio, 77 ms for 8-12 s, 94 ms for 12-26 s (before: 84, 107, 145 ms).
+54 ms under 8 s of audio, 68 ms for 8-12 s, 92 ms for 12-26 s (before: 84, 107, 145 ms).
+
+**Fewer simultaneous requests** (the first N of those clips posted at once, medians over 12 bursts, two runs;
+transformers' own `generate` on the same clips, all N in one call, in process):
+
+| simultaneous | p50 | p90 | slowest | transformers, one batch |
+|---|---|---|---|---|
+| 1 | 64-70 ms | 64-70 ms | 64-70 ms | 434 ms |
+| 5 | 121-123 ms | 142-144 ms | 142-144 ms | 703 ms |
+| 15 | 212-221 ms | 247-255 ms | 278-280 ms | 1,406 ms |
+| 25 | 280-284 ms | 318-321 ms | 343-351 ms | 1,806 ms |
+| 50 | 423-438 ms | 479-498 ms | 502-528 ms | 2,832 ms |
+
+At 50 requests the encoder alone is 24.6 TOP of int8 GEMMs (6,808 frames), over 210 ms at what the card sustains at
+150 W, and the slowest tenth of the clips need 95 and more sequential decoding steps.
+
+`FFN_SPARSE=<file>` (opt-in, with `INT8`) runs the encoder feed-forwards' second linear layers 2:4 sparse:
+`python -m kernels.sparse MODEL_DIR OUT.pt CALIBRATION_WAV ...` prunes them for a model (SparseGPT, kernels/sparse.py)
+and `gemm_sparse.cu` multiplies them with `mma.sp` (half the weight bytes, twice a dense instruction's work; its
+output equals the dense kernel's on the same pruned weights). The 50 clips' encoder 277 -> 263 ms and 50 simultaneous
+requests p50 403-413 ms, p90 451-462 ms (484-489 without), for the WER in Validation: about 0.1-0.5 points.
 
 ## Validation
 
@@ -167,12 +194,15 @@ s86k weights were not on the machine) on FLEURS ar_eg (428 clips) and en_us (647
 |---|---|---|---|---|
 | transformers' `generate`, batch 1 | 6.90 | | 6.37 | |
 | `INT8=0` (bf16 arithmetic) | 6.91-6.93 | 414 (96.7 %) | 6.34-6.36 | 629 (97.2 %) |
-| `INT8=1` (default) | 6.80-6.95 | 384 (89.7 %) | 6.33-6.42 | 598 (92.4 %) |
+| `INT8=1` (default) | 6.83-6.88 | 389 (90.9 %) | 6.32-6.34 | 598 (92.4 %) |
+| `INT8=1 FFN_SPARSE=...` (opt-in, 2:4 pruned feed-forwards) | 7.00-7.03 | 265 (61.9 %) | 6.62-6.66 | 427 (66.0 %) |
 
 (Ranges over runs with all clips submitted at once: which pieces share a batch depends on timing, and with it the
 decoder's summation order; identical counts from one run.) int8 changes about one transcript in ten, the way a
 different batch size does, and not the WER; still, run
-`test/arena_check.py` against s86k before relying on the Arena figures below with `INT8=1`. Re-scoring the published predictions with
+`test/arena_check.py` against s86k before relying on the Arena figures below with `INT8=1`. `FFN_SPARSE` prunes
+weights (SparseGPT, no retraining; calibrated on 275 of these clips, on the others 6.81 -> 7.16 and 6.34 -> 6.80) and
+is off by default. Re-scoring the published predictions with
 `test/scorer_check.py` reproduces the published WER v2, v1 and CER exactly.
 
 | Set (clips) | published | forced, transformers' code (Nov 3) | forced, now | `auto`, now |
