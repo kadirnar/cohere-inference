@@ -17,9 +17,10 @@ header unless a language is given. Before that, the input level is normalised (s
 takes the plain mean of the channels instead, as the Arabic Arena feeds the model). The text is the model's own;
 normalized_text is the same text under the Arabic Arena's scoring normaliser (textnorm), for matching and WER.
 Requests are prepared in parallel threads and their pieces decoded together in shared GPU batches (Batcher); at
-most MAX_WAITING are in flight, the rest get 503. Audio and text are kept in memory only (temporary files go to TMPDIR,
-a RAM disk in start.sh, and are deleted with the request); the log has timings, sizes and uvicorn's access lines
-(client address, route, status), no audio or text.
+most MAX_WAITING are in flight, the rest get 503. The model runs with CUDA graphs and Triton kernels (see TRITON and
+GRAPHS); the text is the same as plain transformers gives, up to bf16 rounding. Audio and text are kept in memory
+only (temporary files go to TMPDIR, a RAM disk in start.sh, and are deleted with the request); the log has timings,
+sizes and uvicorn's access lines (client address, route, status), no audio or text.
 
     MODEL=Cohere-AR/cohere-transcribe-ar-sft-v9-full-s86k PORT=8086 python server.py
 """
@@ -34,8 +35,8 @@ import os
 import re
 import subprocess
 import tempfile
-import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -66,6 +67,14 @@ PIECE_S = 25  # longer audio is cut at pauses into pieces of at most this long
 BATCH_SECONDS = 600
 MAX_BATCH = 32
 BATCH_WAIT_S = 0.005
+# Speed-ups, each on by default; set to 0 to run that part as transformers does. TRITON: the encoder's convolution
+# module runs as one Triton kernel (kernels/conv_module.py) and its relative-position attention without the extra
+# passes over the position scores (kernels/relpos_attention.py). GRAPHS: CUDA graphs captured at start-up, of the
+# encoder for up to 4 pieces at a time (kernels/graph_encoder.py; bigger batches go through it 4 pieces at a time) and
+# of the decoder step for every batch size, its kernels Triton (kernels/graph_decoder.py, kernels/decoder_kernels.py).
+TRITON = os.environ.get("TRITON", "1") != "0"
+GRAPHS = os.environ.get("GRAPHS", "1") != "0"
+HOP = 160  # samples per log-mel frame
 MAX_NEW_TOKENS = 448  # the model card's value (the Arabic Arena runs it with 440)
 LANGUAGES = ("auto", "ar", "en")
 # Input level (on by default, level=false turns it off), measured from the signal alone, so the only network a request
@@ -140,28 +149,32 @@ class Engine:
         kw = {} if os.path.isdir(model_dir) else {"revision": REVISION}
         self.processor = CohereAsrProcessor.from_pretrained(model_dir, **kw)
         self.model = CohereAsrForConditionalGeneration.from_pretrained(model_dir, dtype=torch.bfloat16, **kw).cuda().eval()
-        self._local = threading.local()
+        self._prompts: dict[tuple[str, bool], torch.Tensor] = {}
+        if TRITON:
+            from kernels.conv_module import patch_conv_modules
+            from kernels.relpos_attention import patch_encoder
 
-    @property
-    def vad(self):
-        """Silero for this thread (it keeps state, so concurrent requests each need their own)."""
-        from silero_vad import load_silero_vad
+            patch_conv_modules(self.model.model.encoder)
+            patch_encoder(self.model.model.encoder)
+        self.graph = None
+        if GRAPHS:
+            from kernels.graph_decoder import GraphDecoder
+            from kernels.graph_encoder import GraphEncoder
 
-        if not hasattr(self._local, "vad"):
-            self._local.vad = load_silero_vad(onnx=True)
-        return self._local.vad
+            encode = GraphEncoder(self.model.model.encoder, max_frames=WHOLE_S * 100 + 1)
+            prompts = {len(self.prompt(language, True)) for language in LANGUAGES}
+            self.graph = GraphDecoder(self.model, encode, max_new_tokens=MAX_NEW_TOKENS, prompt_lengths=tuple(prompts))
+        from kernels.silero_parallel import ParallelSilero
+
+        self.vad = ParallelSilero("cuda")  # Silero's own probabilities and regions, the network run in parallel
 
     def pieces(self, x: np.ndarray) -> list[tuple[int, int]]:
         """(start, end) samples: the whole audio up to 30 s, otherwise Silero speech regions packed into pieces of at
         most 25 s, 0.2 s around each."""
-        from silero_vad import get_speech_timestamps
-
         if len(x) <= WHOLE_S * SR:
             return [(0, len(x))]
-        self.vad.reset_states()
-        regions = get_speech_timestamps(torch.from_numpy(np.ascontiguousarray(x)), self.vad, sampling_rate=SR,
-                                        threshold=0.5, min_speech_duration_ms=200, min_silence_duration_ms=300,
-                                        max_speech_duration_s=PIECE_S - 1)
+        regions = self.vad.speech_timestamps(x, threshold=0.5, min_speech_duration_ms=200, min_silence_duration_ms=300,
+                                             max_speech_duration_s=PIECE_S - 1)
         out, start, end = [], None, None
         for r in regions:
             if start is not None and r["end"] - start > (PIECE_S - 0.4) * SR:
@@ -205,34 +218,54 @@ class Engine:
             mix = np.sum([ch if (lv := cls.speech_level(ch)) is None else gained(ch, lv) for ch in chans], axis=0)
         return (mix / max(1.0, float(np.abs(mix).max()) / 0.99)).astype(np.float32)
 
-    def prepare(self, x: np.ndarray, level: bool = True) -> tuple[np.ndarray, list[tuple[int, int]]]:
-        """(mono audio, pieces) of (samples, channels) audio: levelled, or the mean of the channels with level=False."""
+    def features(self, audio: np.ndarray) -> torch.Tensor:
+        """Normalised log-mel frames (frames, 128) of one piece, computed on the CPU in the request's own thread."""
+        return self.processor.feature_extractor([audio], sampling_rate=SR, return_tensors="pt")["input_features"][0]
+
+    def prepare(self, x: np.ndarray, level: bool = True) -> tuple[list[tuple[int, int]], list[torch.Tensor]]:
+        """(pieces, their log-mel frames) of (samples, channels) audio: levelled, or the mean of the channels with
+        level=False."""
         x = self.level(x) if level else x.mean(axis=1).astype(np.float32)
-        return x, self.pieces(x)
+        spans = self.pieces(x)
+        return spans, [self.features(x[s:e]) for s, e in spans]
+
+    def prompt(self, language: str, punctuation: bool) -> torch.Tensor:
+        """The decoder prompt: the full one for a forced language, up to <|emo:undefined|> for language=auto."""
+        key = (language, punctuation)
+        if key not in self._prompts:
+            ids = self.processor(audio=[np.zeros(SR, np.float32)], sampling_rate=SR, punctuation=punctuation,
+                                 language="ar" if language == "auto" else language, return_tensors="pt")
+            self._prompts[key] = ids["decoder_input_ids"][0, :4] if language == "auto" else ids["decoder_input_ids"][0]
+        return self._prompts[key]
 
     @staticmethod
-    def batches(lengths: list[int]) -> list[list[int]]:
+    def batches(frames: list[int]) -> list[list[int]]:
         """Indices grouped into GPU batches, shortest first, within MAX_BATCH pieces and BATCH_SECONDS padded."""
         out, cur = [], []
-        for i in sorted(range(len(lengths)), key=lambda i: lengths[i]):
-            if cur and (lengths[i] * (len(cur) + 1) > BATCH_SECONDS * SR or len(cur) >= MAX_BATCH):
+        for i in sorted(range(len(frames)), key=lambda i: frames[i]):
+            if cur and (frames[i] * HOP * (len(cur) + 1) > BATCH_SECONDS * SR or len(cur) >= MAX_BATCH):
                 out.append(cur)
                 cur = []
             cur.append(i)
         return out + [cur] if cur else out
 
     @torch.no_grad()
-    def decode(self, audio: list[np.ndarray], language: str, punctuation: bool) -> list[tuple[str, str]]:
-        """(text, language) of each piece, in one generate call."""
+    def decode(self, feats: list[torch.Tensor], language: str, punctuation: bool) -> list[tuple[str, str]]:
+        """(text, language) of each piece, decoded together: the pieces' frames padded with zeros and masked, as the
+        processor pads a batch; greedy, through the CUDA graphs (GRAPHS) or transformers' generate."""
         auto = language == "auto"
-        inputs = self.processor(audio=audio, sampling_rate=SR, language="ar" if auto else language,
-                                punctuation=punctuation, return_tensors="pt")
-        if auto:
-            inputs["decoder_input_ids"] = inputs["decoder_input_ids"][:, :4]  # up to <|emo:undefined|>
-        inputs.pop("audio_chunk_index", None)  # pieces are within the feature extractor's 30 s, so never cut
-        inputs = {k: v.cuda().to(torch.bfloat16) if v.is_floating_point() else v.cuda() for k, v in inputs.items()}
-        gen = self.model.generate(**inputs, do_sample=False, max_new_tokens=MAX_NEW_TOKENS)
-        assert len(gen) == len(audio)
+        n = max(len(f) for f in feats)
+        x = torch.zeros(len(feats), n, feats[0].shape[1])
+        mask = torch.zeros(len(feats), n, dtype=torch.bool)
+        for i, f in enumerate(feats):
+            x[i, :len(f)], mask[i, :len(f)] = f, True
+        x, mask, ids = x.cuda().to(torch.bfloat16), mask.cuda(), self.prompt(language, punctuation)
+        if self.graph and self.graph.fits(len(feats), n):
+            gen = self.graph.generate(x, mask, ids)
+        else:
+            gen = self.model.generate(input_features=x, attention_mask=mask, do_sample=False,
+                                      decoder_input_ids=ids.repeat(len(feats), 1).cuda(), max_new_tokens=MAX_NEW_TOKENS)
+        assert len(gen) == len(feats)
         tok, out = self.processor.tokenizer, []
         for raw, text in zip(tok.batch_decode(gen), tok.batch_decode(gen, skip_special_tokens=True)):
             text = " ".join(text.split())
@@ -245,13 +278,22 @@ class Engine:
 
     def __call__(self, x: np.ndarray, language: str = "auto", punctuation: bool = True, level: bool = True) -> list[dict]:
         """Segments of one recording ((samples, channels)), decoded on its own (the scripts' entry point)."""
-        x, spans = self.prepare(x, level)
-        audio = [x[s:e] for s, e in spans]
+        spans, feats = self.prepare(x, level)
         res: list[tuple[str, str]] = [("", language)] * len(spans)
-        for idx in self.batches([len(a) for a in audio]):
-            for i, r in zip(idx, self.decode([audio[i] for i in idx], language, punctuation)):
+        for idx in self.batches([len(f) for f in feats]):
+            for i, r in zip(idx, self.decode([feats[i] for i in idx], language, punctuation)):
                 res[i] = r
         return segments(spans, res)
+
+    def warm_up(self) -> None:
+        """Decode noise with each prompt in batches of 1 and 2 and cut 40 s of it, so the first requests do not set up
+        cuBLAS, cuDNN or the tokenizer."""
+        rng = np.random.default_rng(0)
+        for language in ("auto", "ar"):
+            for batch in (1, 2):
+                audio = [(rng.standard_normal(5 * SR) * 0.05).astype(np.float32) for _ in range(batch)]
+                self.decode([self.features(a) for a in audio], language, True)
+        self.pieces((rng.standard_normal(40 * SR) * 0.05).astype(np.float32))
 
 
 def segments(spans: list[tuple[int, int]], results: list[tuple[str, str]]) -> list[dict]:
@@ -265,10 +307,11 @@ class Batcher:
 
     def __init__(self, engine: Engine):
         self.engine, self.queue = engine, asyncio.Queue()
+        self.gpu = ThreadPoolExecutor(1, thread_name_prefix="gpu")  # not shared with the requests' preparation
 
-    async def submit(self, audio: list[np.ndarray], language: str, punctuation: bool) -> list[tuple[str, str]]:
+    async def submit(self, feats: list[torch.Tensor], language: str, punctuation: bool) -> list[tuple[str, str]]:
         future = asyncio.get_running_loop().create_future()
-        await self.queue.put((audio, language, punctuation, future))
+        await self.queue.put((feats, language, punctuation, future))
         return await future
 
     async def run(self) -> None:
@@ -277,20 +320,21 @@ class Batcher:
             await asyncio.sleep(BATCH_WAIT_S)
             while not self.queue.empty():
                 jobs.append(self.queue.get_nowait())
-            results = [[None] * len(audio) for audio, _, _, _ in jobs]
+            results = [[None] * len(feats) for feats, _, _, _ in jobs]
             groups: dict[tuple[str, bool], list[tuple[int, int]]] = {}
-            for j, (audio, language, punctuation, _) in enumerate(jobs):
-                for k in range(len(audio)):
+            for j, (feats, language, punctuation, _) in enumerate(jobs):
+                for k in range(len(feats)):
                     groups.setdefault((language, punctuation), []).append((j, k))
-            left = [len(audio) for audio, _, _, _ in jobs]
+            left = [len(feats) for feats, _, _, _ in jobs]
             for j, n in enumerate(left):
                 if n == 0:  # no speech found: nothing to decode
                     jobs[j][3].set_result([])
             try:
                 for (language, punctuation), items in groups.items():
-                    audio = [jobs[j][0][k] for j, k in items]
-                    for idx in self.engine.batches([len(a) for a in audio]):
-                        out = await asyncio.to_thread(self.engine.decode, [audio[i] for i in idx], language, punctuation)
+                    feats = [jobs[j][0][k] for j, k in items]
+                    for idx in self.engine.batches([len(f) for f in feats]):
+                        out = await asyncio.get_running_loop().run_in_executor(
+                            self.gpu, self.engine.decode, [feats[i] for i in idx], language, punctuation)
                         for i, r in zip(idx, out):
                             j, k = items[i]
                             results[j][k] = r
@@ -298,10 +342,11 @@ class Batcher:
                             if left[j] == 0 and not jobs[j][3].done():  # answer each request as soon as it is complete
                                 jobs[j][3].set_result(results[j])
                 log.info("batched requests=%d pieces=%d", len(jobs), sum(len(r) for r in results))
-            except Exception as e:  # noqa: BLE001 (passed on to every waiting request)
+            except Exception:  # noqa: BLE001 (logged once; each waiting request fails with its own error)
+                log.exception("decoding failed: requests=%d", len(jobs))
                 for _, _, _, future in jobs:
                     if not future.done():
-                        future.set_exception(e)
+                        future.set_exception(RuntimeError("decoding failed"))
 
 
 # ---- app -----------------------------------------------------------------------------------------------------------
@@ -316,7 +361,7 @@ async def lifespan(_: FastAPI):
     global engine, batcher
     t = time.time()
     engine = await asyncio.to_thread(Engine, MODEL)
-    await asyncio.to_thread(engine, np.zeros((SR, 1), dtype=np.float32))  # warm-up
+    await asyncio.to_thread(engine.warm_up)
     batcher = Batcher(engine)
     task = asyncio.create_task(batcher.run())
     log.info("ready: %s (%s) from %s in %.0f s", MODEL_ID, REVISION[:10], MODEL, time.time() - t)
@@ -365,9 +410,9 @@ async def run(file: UploadFile, language: str, punctuation: bool, level: bool = 
         raise HTTPException(503, "busy, try again in a minute")
     waiting += 1
     try:
-        mono, spans = await asyncio.to_thread(engine.prepare, x, level)
+        spans, feats = await asyncio.to_thread(engine.prepare, x, level)
         t1 = time.time()
-        segs = segments(spans, await batcher.submit([mono[s:e] for s, e in spans], language, punctuation))
+        segs = segments(spans, await batcher.submit(feats, language, punctuation))
     finally:
         waiting -= 1
     t2 = time.time()

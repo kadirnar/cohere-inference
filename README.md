@@ -24,7 +24,7 @@ tmux session, restarts it if it exits and, unless `TUNNEL=0`, opens a public
 [Cloudflare quick tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/)
 to it (needs `cloudflared`; the `https://*.trycloudflare.com` address is printed in `logs/tunnel.log` and changes when
 the tunnel restarts). Its settings come from the environment or from a `local.env` file next to it (not in git).
-About 5 GB of GPU memory.
+About 7 GB of GPU memory; start-up (loading the weights, capturing the CUDA graphs) takes about 15 s.
 
 ## API
 
@@ -70,33 +70,90 @@ log holds timings, sizes and access lines (client address, route, status), no au
    then it is brought to -20 dBFS. `level=false` takes the plain mean of the channels, as the Arabic Arena feeds the
    model.
 4. Audio up to 30 s goes to the model whole (as the model card says and the Arena runs it); longer audio is cut at
-   pauses (Silero) into pieces of at most 25 s, decoded in batches.
-5. Greedy decoding, at most 448 new tokens (the card's value). With `language=auto` the decoder prompt stops after
+   pauses (Silero's own probabilities and regions, its network run over all windows at once on the GPU) into pieces of
+   at most 25 s, decoded in batches.
+5. Greedy decoding, at most 448 new tokens (the card's value), through CUDA graphs and Triton kernels (see Speed). With `language=auto` the decoder prompt stops after
    `<|emo:undefined|>` and the model writes its own language header, per piece; with `ar` / `en` the full prompt with
    `<|pnc|>` is used. No post-processing of the text.
+
+## Speed
+
+The service runs the model's weights with the same arithmetic as transformers (bf16, greedy), but through CUDA graphs
+and Triton kernels (`kernels/`, on by default; `TRITON=0` and `GRAPHS=0` run transformers' own code):
+
+- **Encoder** (FastConformer, 48 layers, 1.9 B parameters). The convolution module is one Triton kernel: GLU, padding
+  mask, depthwise convolution, BatchNorm and SiLU in a single pass, in (time, channel) layout (`conv_module.py`). The
+  relative-position attention projects the positions once per batch and shifts the scores without copies
+  (`relpos_attention.py`). At batch 1 the encoder is held back by launching its ~4,200 kernels (40-50 ms of CPU for
+  16-30 ms of GPU work), so it is captured as CUDA graphs at start-up for 1, 2 and 4 pieces at every 2 s of length,
+  the input zero-padded and masked like any padded batch (`graph_encoder.py`); bigger batches go through 4 pieces at a
+  time, each group trimmed to its own longest piece.
+- **Decoder** (8 layers). transformers' `generate` launches every kernel from Python, projects the encoder output again
+  at every step and grows the KV cache by concatenation. Here a step is one CUDA graph replay per batch size, over
+  buffers allocated once (`graph_decoder.py`), and its kernels are Triton (`decoder_kernels.py`): projections with
+  their bias (and ReLU) fused, each residual sum fused into the next LayerNorm, attention over the valid part of the
+  KV cache and of the audio frames only (lengths read from device memory, so one graph serves every position and audio
+  length; keys spread over more programs when there are few rows), the new key and value written to the cache by the
+  attention kernel, and the greedy choice (first index among equal logits, as `torch.argmax`), prompt forcing and
+  end-of-text bookkeeping in one kernel. The prompt (4 tokens with `auto`, 10 with a language) goes in one pass of its
+  own graph, and the host reads the end-of-text flag from pinned memory one step behind, so the GPU never waits for it.
+- **Silero** (audio over 30 s). Only its LSTM depends on earlier windows, so the STFT and convolutions run on all
+  windows at once and the LSTM over the whole recording in a few cuDNN calls (`silero_parallel.py`): the same
+  probabilities as silero-vad's onnxruntime loop (largest difference 1.7e-5, no window on the other side of a
+  threshold) and the same regions on all 22 test recordings, 67 times faster.
+
+One request at a time (`bench/latency.py`: pieces of `test/long_mixed.wav`, end to end from samples to text, median of
+5 runs on an A10; before = commit `f7cf0fe`, transformers' `generate` and Silero through onnxruntime):
+
+| Audio | transformers (model card's code) | service before | service now |
+|---|---|---|---|
+| 3 s | 162 ms | 169 ms | 38 ms |
+| 7 s | 226 ms | 236 ms | 53 ms |
+| 15 s | 365 ms | 376 ms | 91 ms |
+| 25 s | 576 ms | 594 ms | 144 ms |
+| 115 s (6 pieces) | 1,023 ms | 1,823 ms | 352 ms |
+
+For a single 17 s clip that is 13 ms of log-mel features (CPU), 30 ms of encoder and 70 ms of decoder for 86 steps
+(0.81 ms per step, 4.9 ms in `generate`); Silero cuts the 115 s recording in 11 ms instead of 0.84 s
+(`bench/stages.py`). Whole sets, one recording at a time (`bench/speed.py`):
+
+| Inputs | audio | transformers | before | now |
+|---|---|---|---|---|
+| 100 short clips (FLEURS Arabic, LibriSpeech) | 888 s | 27.4 s | 28.1 s | 6.5 s |
+| `test/long_mixed.wav` | 114 s | 1.00 s | 1.76 s | 0.35 s |
+| 21 Audioluna calls (two-channel) | 5,241 s | 33.8 s | 69.7 s | 15.3 s |
+
+Under load (50 simultaneous requests, below) the median answer takes 0.84 s and the GPU serves 320 seconds of audio
+per second, against 2.11 s and 120 before. GPU memory: about 7 GB (weights 4.2 GB, decoder buffers 1 GB, graph memory
+0.8 GB). All the accuracy figures below are measured with these kernels and graphs on.
 
 ## Validation
 
 All Arena figures are WER v2 (the Arena's own scorer and normaliser, per-utterance errors capped at the reference
 length), with the endpoint called over HTTP like any client.
 
-**Same transcripts as the model.** On 2,028 clips (SADA telephony, Casablanca call-centre, EdAcc, FLEURS Arabic) the
-endpoint's text equals the model run through the Arena's runner one clip at a time on 100 % of clips; the Arena's runner
-at its batch size of 32 reproduces the published predictions on 100 %. Batch 1 and batch 32 differ on 1.6-12.7 % of
-clips (bf16 padding) and by at most 0.1 WER. Re-scoring the published predictions with `test/scorer_check.py`
-reproduces the published WER v2, v1 and CER exactly.
+**Same transcripts as the model.** With transformers' own code, on 2,028 clips (SADA telephony, Casablanca call-centre,
+EdAcc, FLEURS Arabic) the endpoint's text equaled the model run through the Arena's runner one clip at a time on 100 %
+of clips; the Arena's runner at its batch size of 32 reproduces the published predictions on 100 %. Batch 1 and batch
+32 differ on 1.6-12.7 % of clips (bf16 padding) and by at most 0.1 WER. The CUDA graphs and Triton kernels compute the
+same thing in another order: about 97 % of clips come out identical to transformers' output, the rest differ the way
+a different batch size does, and the WER stays where it was. Re-scoring the published predictions with
+`test/scorer_check.py` reproduces the published WER v2, v1 and CER exactly.
 
-| Set (clips) | published | endpoint, language forced | endpoint, `auto` |
-|---|---|---|---|
-| fleurs_ar/clean (428) | 3.72 | 3.67 | 3.66 |
-| sada/telephony_v2 (300) | 22.84 | 22.91 | 22.84 |
-| casablanca/callcenter_v2 (300) | 39.54 | 39.64 | 39.67 |
-| mixat_cs/clean (1,000) | 10.94 | 10.96 | 10.96 |
-| cv18_ar/noisy (300) | 8.75 | 8.82 | 8.88 |
-| fleurs_en/clean (647) | 5.52 | 5.52 | 5.48 |
-| edacc/clean (1,000) | 12.61 | 12.65 | 12.70 |
-| earnings22/telephony (300) | 7.45 | 7.41 | 7.43 |
-| librispeech_clean/callcenter (300) | 4.53 | 4.53 | 4.54 |
+| Set (clips) | published | forced, transformers' code (Nov 3) | forced, now | `auto`, now |
+|---|---|---|---|---|
+| fleurs_ar/clean (428) | 3.72 | 3.67 | 3.72 | 3.74 |
+| sada/telephony_v2 (300) | 22.84 | 22.91 | 22.78 | 22.76 |
+| casablanca/callcenter_v2 (300) | 39.54 | 39.64 | 39.54 | 39.51 |
+| mixat_cs/clean (1,000) | 10.94 | 10.96 | 10.93 | 10.95 |
+| cv18_ar/noisy (300) | 8.75 | 8.82 | 8.82 | 8.88 |
+| fleurs_en/clean (647) | 5.52 | 5.52 | 5.34 | 5.35 |
+| edacc/clean (1,000) | 12.61 | 12.65 | 12.65 | 12.70 |
+| earnings22/telephony (300) | 7.45 | 7.41 | 7.29 | 7.37 |
+| librispeech_clean/callcenter (300) | 4.53 | 4.53 | 4.60 | 4.58 |
+| mean of the 5 Arabic / 4 English sets | 17.16 / 7.53 | 17.20 / 7.53 | 17.16 / 7.47 | 17.17 / 7.50 |
+
+The Nov 3 column predates the input levelling (FLEURS-en clean 5.52 → 5.35 is its doing, see below).
 
 In `auto` mode the model picked the right language on 897 of 900 English and 1,146 of 1,150 Arabic clips
 (`test/lang_check.py`); code-switched clips get an Arabic header with the English words kept.
@@ -131,14 +188,15 @@ are decoded together, at most 32 per GPU batch; each request is answered as soon
 |---|---|---|---|---|
 | one request at a time, 8 queued (before) | 8 of 50 (42 × 503) | 1.98 s | 2.80 s | 24 |
 | one request at a time, queue of 100 | 50 | 8.54 s | 17.72 s | 26 |
-| shared batches (now), local | 50 | 2.11 s | 3.78 s | 120 |
-| shared batches (now), through the public tunnel | 50 | 5.80 s | 7.31 s | 62 |
+| shared batches, transformers' code, local | 50 | 2.11 s | 3.78 s | 120 |
+| shared batches, transformers' code, through the public tunnel | 50 | 5.80 s | 7.31 s | 62 |
+| shared batches, CUDA graphs and Triton kernels (now), local | 50 | 0.84 s | 1.41 s | 320 |
+| the same through the public tunnel | 50 | 1.08 s | 1.51 s | 300 |
 
-A lone request takes the same time as before (0.3 s for a 9 s clip). Sharing a batch can change a transcript slightly
-(bf16 padding): 98 of 100 clips came out identical one at a time and all at once (`bench/batch_consistency.py`; Arena
-L2 WER 2.82 % and 3.04 %), and the Audioluna calls score 12.22 against 12.26 before. `bench/speed.py` compares the
-service with the model card's plain code: the same speed on clips up to 30 s, about half the speed on long
-recordings (Silero cuts them at pauses on the CPU), with a lower WER on the Audioluna calls (12.26 against 12.74).
+A lone request takes 0.08 s for a 9 s clip (0.3 s before). Sharing a batch no longer changes a transcript: 100 of 100
+clips come out identical one at a time and all at once (`bench/batch_consistency.py`, Arena L2 WER 2.88 % both ways;
+98 of 100 with transformers' code, 2.82 % and 3.04 %). The Audioluna calls score 12.19 (12.22 with transformers' code,
+12.74 for the model card's plain code, which cuts long audio itself).
 
 ## Normalisers (`textnorm/`, `norm_study/`)
 
@@ -175,6 +233,8 @@ mostly no hamza (21 % of Arabic outputs against 64 % of references) and numbers 
 | `start.sh` | tmux + restart loop + optional quick tunnel |
 | `test/` | `make_clips.py` (public test clips from an Arena checkout), `run_tests.py` (formats, errors, routes), `arena_check.py`, `compare_check.py`, `scorer_check.py`, `lang_check.py` |
 | `norm_study/` | the normaliser and input-level studies above |
+| `kernels/` | the Triton kernels and CUDA graphs (see Speed) and Silero run in parallel |
+| `bench/` | `latency.py` and `speed.py` (against the model card's code), `stages.py`, `concurrency.py`, `batch_consistency.py` |
 
 The Arena scripts run from a checkout of the Arabic Arena (`github.com/kadirnar/arabic-arena`, branch `scoring-v2`) with
 its built data and published predictions (`cd $ARENA_REPO; python /path/to/test/arena_check.py URL`). The Audioluna

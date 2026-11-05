@@ -1,10 +1,12 @@
 """Inference time of this service's pipeline against plain transformers use of the same model (the model card's code),
 on one GPU, one recording at a time, each timed after a warm-up as the median of --repeats runs.
 
-  card      the card's code: the whole recording to the processor (which cuts audio over 35 s itself at low-energy
-            points), the channels averaged, greedy, 448 new tokens, the model's own language header
-  service   server.Engine as the service runs it: level normalisation, audio up to 30 s whole and longer audio cut at
-            pauses (Silero) into pieces of at most 25 s decoded in batches, the same decoding
+  card      the card's code on its own copy of the model, transformers as installed (no Triton kernels, no CUDA
+            graphs): the whole recording to the processor (which cuts audio over 35 s itself at low-energy points), the
+            channels averaged, greedy, 448 new tokens, the model's own language header
+  service   server.Engine as the service runs it (with TRITON and GRAPHS as set in the environment): level
+            normalisation, audio up to 30 s whole and longer audio cut at pauses (Silero) into pieces of at most 25 s
+            decoded in batches, the same decoding
 
 Short clips come from the Arabic Arena's built sets (run from its checkout); long recordings are test/long_mixed.wav
 and, with AUDIOLUNA_PARQUET, the 20 Audioluna calls (private: only timings and pooled WER are printed; transcripts go
@@ -93,8 +95,13 @@ def main():
     ap.add_argument("--url", help="also time the running service over HTTP")
     args = ap.parse_args()
 
-    engine = server.Engine(os.environ.get("MODEL", server.MODEL_ID))
-    card = Card(engine.processor, engine.model)
+    from transformers import CohereAsrForConditionalGeneration
+
+    model_dir = os.environ.get("MODEL", server.MODEL_ID)
+    engine = server.Engine(model_dir)
+    kw = {} if os.path.isdir(model_dir) else {"revision": server.REVISION}
+    plain = CohereAsrForConditionalGeneration.from_pretrained(model_dir, dtype=torch.bfloat16, **kw).cuda().eval()
+    card = Card(engine.processor, plain)
     service = lambda x: " ".join(s["text"] for s in engine(x, "auto", True, True) if s["text"])  # noqa: E731
     groups = {"short clips (FLEURS ar + LibriSpeech)": [], "long recordings": []}
     for lang, name in (("ar", "fleurs_ar"), ("en", "librispeech_clean")):

@@ -1,11 +1,12 @@
-# Python 3.11; a CUDA GPU with ~6 GB free. Install torch for your CUDA version first (e.g. torch 2.11 + cu128).
+# Python 3.11; an NVIDIA GPU with ~8 GB free. Install torch for your CUDA version first (e.g. torch 2.11 + cu128);
+# it brings Triton (tested with 3.6), which the kernels in kernels/ need.
 torch
 transformers>=5.4  # CohereAsrForConditionalGeneration (tested with 5.20.2)
 numpy
 soundfile
 soxr
 silero-vad
-onnxruntime
+onnxruntime  # norm_study/levelling.py (Silero through onnxruntime)
 fastapi==0.115.12
 uvicorn==0.34.2
 python-multipart==0.0.20
