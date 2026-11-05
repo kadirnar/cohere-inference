@@ -3,9 +3,9 @@
 Pieces of 3, 7, 15 and 25 s and the whole of test/long_mixed.wav (114 s, Arabic and English speech), each timed alone
 on the GPU (median of --repeats runs after a warm-up), end to end from 16 kHz samples to text:
 
-  card      the card's code on its own copy of the model, transformers as installed (no Triton kernels, no CUDA
-            graphs): processor (which cuts audio over 35 s itself), generate, greedy, 448 new tokens
-  service   server.Engine with TRITON and GRAPHS as set in the environment: level, pieces (Silero over 30 s),
+  card      the card's code on its own copy of the model, transformers as installed (none of this service's
+            kernels): processor (which cuts audio over 35 s itself), generate, greedy, 448 new tokens
+  service   server.Engine with FAST and INT8 as set in the environment: level, pieces (Silero over 30 s),
             log-mel per piece, decoding
 
     MODEL=/path/to/model python bench/latency.py   # from the repository root

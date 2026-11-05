@@ -1,10 +1,10 @@
 """Inference time of this service's pipeline against plain transformers use of the same model (the model card's code),
 on one GPU, one recording at a time, each timed after a warm-up as the median of --repeats runs.
 
-  card      the card's code on its own copy of the model, transformers as installed (no Triton kernels, no CUDA
-            graphs): the whole recording to the processor (which cuts audio over 35 s itself at low-energy points), the
+  card      the card's code on its own copy of the model, transformers as installed (none of this service's
+            kernels): the whole recording to the processor (which cuts audio over 35 s itself at low-energy points), the
             channels averaged, greedy, 448 new tokens, the model's own language header
-  service   server.Engine as the service runs it (with TRITON and GRAPHS as set in the environment): level
+  service   server.Engine as the service runs it (with FAST and INT8 as set in the environment): level
             normalisation, audio up to 30 s whole and longer audio cut at pauses (Silero) into pieces of at most 25 s
             decoded in batches, the same decoding
 

@@ -9,9 +9,12 @@ silero-vad
 onnxruntime  # norm_study/levelling.py (Silero through onnxruntime)
 fastapi==0.115.12
 uvicorn==0.34.2
+httptools  # uvicorn: C HTTP parser (h11 is pure Python and slow under many simultaneous uploads)
+uvloop  # uvicorn: faster event loop
 python-multipart==0.0.20
 regex
 rapidfuzz
 whisper-normalizer==1.0.0
 requests  # wer.py and the test scripts
 pyarrow  # test and study scripts
+ninja  # torch's JIT build of kernels/csrc (first start compiles them, about a minute)

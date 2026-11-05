@@ -5,8 +5,9 @@ A speech-to-text service for
 (commit `3ec483a713`, a community fine-tune of
 [CohereLabs/cohere-transcribe-arabic-07-2026](https://huggingface.co/CohereLabs/cohere-transcribe-arabic-07-2026), not
 made or endorsed by Cohere): Arabic in many dialects, English and code-switched Arabic-English, phone calls included.
-One FastAPI process on one GPU, a test page, an OpenAI-style route, input level normalisation, scoring-normalised text
-and WER against a reference; optionally published through a Cloudflare quick tunnel, without a key. The evaluation and
+One GPU process with its own CUDA kernels and a few FastAPI worker processes on one GPU, a test page, an OpenAI-style
+route, input level normalisation, scoring-normalised text and WER against a reference; optionally published through a
+Cloudflare quick tunnel, without a key. The evaluation and
 normalisation-study scripts behind its defaults are in `test/` and `norm_study/`.
 
 ## Quick start
@@ -24,7 +25,9 @@ tmux session, restarts it if it exits and, unless `TUNNEL=0`, opens a public
 [Cloudflare quick tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/)
 to it (needs `cloudflared`; the `https://*.trycloudflare.com` address is printed in `logs/tunnel.log` and changes when
 the tunnel restarts). Its settings come from the environment or from a `local.env` file next to it (not in git).
-About 7 GB of GPU memory; start-up (loading the weights, capturing the CUDA graphs) takes about 15 s.
+About 6.7 GB of GPU memory (10 GB with `INT8=0`). The first start compiles the CUDA kernels of `kernels/csrc` (needs
+`nvcc` and `ninja`; about a minute, cached in `~/.cache/torch_extensions`); after that start-up (loading the weights,
+capturing the decoder's CUDA graphs, a warm-up burst) takes about 15 s.
 
 ## API
 
@@ -53,8 +56,8 @@ print(client.audio.transcriptions.create(model="s86k", file=open("call.wav", "rb
 The response has `text` (the model's own words), `normalized_text` (the same under the Arabic Arena's scoring
 normaliser), `language`, `duration`, `processing_time`, `level`, `segments` (start, end, language, text,
 normalized_text) and, with a reference, `wer` (`l2`: Arabic Arena normaliser, `ext`: the Test Arabic ASR Benchmark's
-`normalize_ext`; edits, reference words, WER). Limits: 100 MB, 30 minutes of audio, 128 requests in flight (503 beyond);
-requests that arrive together are decoded together in shared GPU batches. Audio and transcripts are kept in memory only (uploads over 1 MB spool to `TMPDIR`); the
+`normalize_ext`; edits, reference words, WER). Limits: 100 MB, 30 minutes of audio, 128 requests in flight per HTTP worker
+(503 beyond); the pieces of all waiting requests are encoded together and decoded with continuous batching (see Speed). Audio and transcripts are kept in memory only (uploads over 1 MB spool to `TMPDIR`); the
 log holds timings, sizes and access lines (client address, route, status), no audio or text.
 
 ## What happens to the audio
@@ -72,60 +75,77 @@ log holds timings, sizes and access lines (client address, route, status), no au
 4. Audio up to 30 s goes to the model whole (as the model card says and the Arena runs it); longer audio is cut at
    pauses (Silero's own probabilities and regions, its network run over all windows at once on the GPU) into pieces of
    at most 25 s, decoded in batches.
-5. Greedy decoding, at most 448 new tokens (the card's value), through CUDA graphs and Triton kernels (see Speed). With `language=auto` the decoder prompt stops after
+5. Greedy decoding, at most 448 new tokens (the card's value), through the CUDA kernels of `kernels/csrc` (see Speed).
+   With `language=auto` the decoder prompt stops after
    `<|emo:undefined|>` and the model writes its own language header, per piece; with `ar` / `en` the full prompt with
    `<|pnc|>` is used. No post-processing of the text.
 
 ## Speed
 
-The service runs the model's weights with the same arithmetic as transformers (bf16, greedy), but through CUDA graphs
-and Triton kernels (`kernels/`, on by default; `TRITON=0` and `GRAPHS=0` run transformers' own code):
+Everything after the audio decoding runs through CUDA kernels written for this model (`kernels/csrc`, compiled on the
+first start; `FAST=0` runs transformers' own code instead), scheduled for many simultaneous requests:
 
-- **Encoder** (FastConformer, 48 layers, 1.9 B parameters). The convolution module is one Triton kernel: GLU, padding
-  mask, depthwise convolution, BatchNorm and SiLU in a single pass, in (time, channel) layout (`conv_module.py`). The
-  relative-position attention projects the positions once per batch and shifts the scores without copies
-  (`relpos_attention.py`). At batch 1 the encoder is held back by launching its ~4,200 kernels (40-50 ms of CPU for
-  16-30 ms of GPU work), so it is captured as CUDA graphs at start-up for 1, 2 and 4 pieces at every 2 s of length,
-  the input zero-padded and masked like any padded batch (`graph_encoder.py`); bigger batches go through 4 pieces at a
-  time, each group trimmed to its own longest piece.
-- **Decoder** (8 layers). transformers' `generate` launches every kernel from Python, projects the encoder output again
-  at every step and grows the KV cache by concatenation. Here a step is one CUDA graph replay per batch size, over
-  buffers allocated once (`graph_decoder.py`), and its kernels are Triton (`decoder_kernels.py`): projections with
-  their bias (and ReLU) fused, each residual sum fused into the next LayerNorm, attention over the valid part of the
-  KV cache and of the audio frames only (lengths read from device memory, so one graph serves every position and audio
-  length; keys spread over more programs when there are few rows), the new key and value written to the cache by the
-  attention kernel, and the greedy choice (first index among equal logits, as `torch.argmax`), prompt forcing and
-  end-of-text bookkeeping in one kernel. The prompt (4 tokens with `auto`, 10 with a language) goes in one pass of its
-  own graph, and the host reads the end-of-text flag from pinned memory one step behind, so the GPU never waits for it.
+- **Processes.** One GPU process (`server.py --gpu`, started by `server.py`) holds the model; `WORKERS` HTTP worker
+  processes (default 8) parse the uploads, decode and level the audio, add the feature extractor's deterministic
+  dither and turn token ids into text, and talk to the GPU process over a local socket. In one process the event
+  loop, the request threads and the threads launching GPU work held each other up through the GIL.
+- **Features** (`kernels/features.py`): the log-mel frames of a whole batch of pieces on the GPU (cuFFT and a few
+  kernels); 0.06 % of the bf16 values differ from the CPU extractor's, by one unit in the last place.
+- **Encoder** (FastConformer, 48 layers, 1.9 B parameters, `kernels/fast_encoder.py`). The pieces' frames are packed
+  (no padding at all) and each layer is 14 kernels launched from C++ (`encoder_loop.cpp`): GEMMs with their epilogues
+  fused (bias, SiLU, GLU, residual sum; `gemm.cu`, a cp.async / ldmatrix / mma.sync kernel that matches cuBLAS's speed
+  and bits), LayerNorm (`encoder_ops.cu`), a relative-position flash attention whose position term is computed from a
+  per-layer table of projected distances inside the kernel (no (T, 2T) score tensor), the convolution module's
+  depthwise convolution with BatchNorm and SiLU, and the subsampling convolutions per piece, channels-last (the first
+  convolution and the depthwise one after it in one kernel). With `INT8` (default) every GEMM is int8 (W8A8:
+  `gemm_int8.cu`, weights per output channel, activations per row, quantized by the kernel that produces them; on the
+  A10's 150 W cap int8 tensor cores do about 1.4x the bf16 work).
+- **Decoder** (8 layers, `kernels/stream_decoder.py`, `decoder_ops.cu`): continuous batching over 128 slots. A piece
+  joins the batch as soon as its encoder chunk is done (its cross-attention keys and values written into its slot)
+  and leaves it at its end-of-text token, when its request is answered; one CUDA graph per bucket of row counts runs a
+  step for any mix of positions and audio lengths (rows read their slot through an active list). Kernels: embedding
+  and LayerNorms, residual + LayerNorm, flash-decoding attention over the slot's cache, greedy choice with prompt
+  forcing. With `INT8` the q/k/v, feed-forward and output-head weights are int8 (W8A16, `dec_w8.cu`: widened to bf16
+  in registers, split-K) and the self- and cross-attention caches are int8 with a scale per 128-vector.
+- **Scheduling** (`kernels/pipeline.py`): an encoder thread takes the waiting pieces in chunks of up to 3,000 encoder
+  frames (any that waited over 0.75 s first, then the shortest third, then the longest, so early requests are answered
+  early and the last chunk decodes quickly) while a decoder thread steps on its own CUDA stream at high priority, so decoding runs beside the encoding
+  of the next chunk. The host reads end-of-text flags one step behind; the GPU never waits for it.
 - **Silero** (audio over 30 s). Only its LSTM depends on earlier windows, so the STFT and convolutions run on all
   windows at once and the LSTM over the whole recording in a few cuDNN calls (`silero_parallel.py`): the same
   probabilities as silero-vad's onnxruntime loop (largest difference 1.7e-5, no window on the other side of a
   threshold) and the same regions on all 22 test recordings, 67 times faster.
 
-One request at a time (`bench/latency.py`: pieces of `test/long_mixed.wav`, end to end from samples to text, median of
-5 runs on an A10; before = commit `f7cf0fe`, transformers' `generate` and Silero through onnxruntime):
+**100 simultaneous requests** (`bench/concurrency.py --dir`: the first 100 FLEURS ar_eg test clips, 1,127 s of audio,
+posted at the same moment over HTTP from the same machine; A10; 6 bursts each; before = commit `dc1d204`, CUDA graphs
+and Triton kernels, one process). These figures use Cohere's base model (`cohere-transcribe-03-2026`, same
+architecture) because the s86k weights were not on the machine:
 
-| Audio | transformers (model card's code) | service before | service now |
+| | p50 latency | slowest | audio seconds per second |
 |---|---|---|---|
-| 3 s | 162 ms | 169 ms | 38 ms |
-| 7 s | 226 ms | 236 ms | 53 ms |
-| 15 s | 365 ms | 376 ms | 91 ms |
-| 25 s | 576 ms | 594 ms | 144 ms |
-| 115 s (6 pieces) | 1,023 ms | 1,823 ms | 352 ms |
+| before | 1.66-1.94 s | 2.97-3.01 s | 377 |
+| now, `INT8=0` (bf16 arithmetic) | 0.88-1.01 s | 1.41-1.50 s | 770 |
+| now, `INT8=1` (default) | 0.63-0.74 s | 0.99-1.05 s | 1,110 |
 
-For a single 17 s clip that is 13 ms of log-mel features (CPU), 30 ms of encoder and 70 ms of decoder for 86 steps
-(0.81 ms per step, 4.9 ms in `generate`); Silero cuts the 115 s recording in 11 ms instead of 0.84 s
-(`bench/stages.py`). Whole sets, one recording at a time (`bench/speed.py`):
+So 100 requests are all answered within about a second: 10 ms of GPU time per request. Under steady load
+(`--sustain 30`: 100 clients, each sending its next clip as soon as the last is answered) the service answers 116
+requests per second (1,307 audio seconds per second, 8.6 ms of GPU per request) with a p50 latency of 0.65 s, p99 1.54
+s and none over 1.70 s; pieces waiting over 0.75 s go first, whatever their length (with 0.5 s: p50 0.97 s, p99 1.32
+s, but bursts end later). Per request the latency cannot
+come near that: a decoding step reads ~130 MB of weights and caches however few rows it has (0.65 ms on an A10), and a
+clip needs one step per token (36-96 for these clips).
 
-| Inputs | audio | transformers | before | now |
-|---|---|---|---|---|
-| 100 short clips (FLEURS Arabic, LibriSpeech) | 888 s | 27.4 s | 28.1 s | 6.5 s |
-| `test/long_mixed.wav` | 114 s | 1.00 s | 1.76 s | 0.35 s |
-| 21 Audioluna calls (two-channel) | 5,241 s | 33.8 s | 69.7 s | 15.3 s |
-
-Under load (50 simultaneous requests, below) the median answer takes 0.84 s and the GPU serves 320 seconds of audio
-per second, against 2.11 s and 120 before. GPU memory: about 7 GB (weights 4.2 GB, decoder buffers 1 GB, graph memory
-0.8 GB). All the accuracy figures below are measured with these kernels and graphs on.
+Where the time goes (`bench/stages.py`, `INT8=1`): one 14 s Arabic clip takes 1 ms of features, 18 ms of encoder
+(178 frames) and 66 ms of decoder (96 steps, 0.68 ms each); 32 clips in one call 14 ms, 190 ms (4,371 frames) and 141
+ms (136 steps, 1.04 ms each). The encoder of the 100 clips (14,160 frames, 4 chunks): transformers' code 1,825 ms,
+packed bf16 kernels 969 ms, int8 636 ms. A decoding step: 0.65 / 0.70 / 0.95 / 1.42 / 2.53 ms for 1 / 8 / 32 / 64 /
+128 rows (bf16 graphs before: 0.83 / 0.92 / 1.24 / 1.91 / 2.91). It is still about twice the time its bytes take at
+the A10's bandwidth (a step of ~90 kernels; a 2 MB read alone takes 5.3 us in a kernel of its own against 4.0 us
+streamed). A persistent kernel running the whole step (one CTA per SM, grid barriers of ~1 us between its ~66 phases,
+the weights streamed ahead through cp.async) was tried and came out slower, 0.73 ms for one row and 1.47 ms for 32:
+every phase keeps a chain of dependent latencies (barrier, the activations from L2, the cross-warp sum), and shared
+memory holds too few weight units ahead to keep the memory busy through the short phases. One request at a time (HTTP, FLEURS clips, median):
+65 ms under 8 s of audio, 77 ms for 8-12 s, 94 ms for 12-26 s (before: 84, 107, 145 ms).
 
 ## Validation
 
@@ -135,9 +155,24 @@ length), with the endpoint called over HTTP like any client.
 **Same transcripts as the model.** With transformers' own code, on 2,028 clips (SADA telephony, Casablanca call-centre,
 EdAcc, FLEURS Arabic) the endpoint's text equaled the model run through the Arena's runner one clip at a time on 100 %
 of clips; the Arena's runner at its batch size of 32 reproduces the published predictions on 100 %. Batch 1 and batch
-32 differ on 1.6-12.7 % of clips (bf16 padding) and by at most 0.1 WER. The CUDA graphs and Triton kernels compute the
-same thing in another order: about 97 % of clips come out identical to transformers' output, the rest differ the way
-a different batch size does, and the WER stays where it was. Re-scoring the published predictions with
+32 differ on 1.6-12.7 % of clips (bf16 padding) and by at most 0.1 WER. The table below was measured on s86k with the
+previous kernels (commit `dc1d204`): they computed the same thing in another order, about 97 % of clips identical to
+transformers' output, the rest differing the way a different batch size does, and the WER where it was.
+
+The current kernels were checked with Cohere's base model (`cohere-transcribe-03-2026`, the same architecture; the
+s86k weights were not on the machine) on FLEURS ar_eg (428 clips) and en_us (647), `auto`, against transformers'
+`generate` one clip at a time (WER with the Arena L2 normaliser):
+
+| | ar_eg WER | identical | en_us WER | identical |
+|---|---|---|---|---|
+| transformers' `generate`, batch 1 | 6.90 | | 6.37 | |
+| `INT8=0` (bf16 arithmetic) | 6.91-6.93 | 414 (96.7 %) | 6.34-6.36 | 629 (97.2 %) |
+| `INT8=1` (default) | 6.80-6.95 | 384 (89.7 %) | 6.33-6.42 | 598 (92.4 %) |
+
+(Ranges over runs with all clips submitted at once: which pieces share a batch depends on timing, and with it the
+decoder's summation order; identical counts from one run.) int8 changes about one transcript in ten, the way a
+different batch size does, and not the WER; still, run
+`test/arena_check.py` against s86k before relying on the Arena figures below with `INT8=1`. Re-scoring the published predictions with
 `test/scorer_check.py` reproduces the published WER v2, v1 and CER exactly.
 
 | Set (clips) | published | forced, transformers' code (Nov 3) | forced, now | `auto`, now |
@@ -190,8 +225,10 @@ are decoded together, at most 32 per GPU batch; each request is answered as soon
 | one request at a time, queue of 100 | 50 | 8.54 s | 17.72 s | 26 |
 | shared batches, transformers' code, local | 50 | 2.11 s | 3.78 s | 120 |
 | shared batches, transformers' code, through the public tunnel | 50 | 5.80 s | 7.31 s | 62 |
-| shared batches, CUDA graphs and Triton kernels (now), local | 50 | 0.84 s | 1.41 s | 320 |
+| shared batches, CUDA graphs and Triton kernels (`dc1d204`), local | 50 | 0.84 s | 1.41 s | 320 |
 | the same through the public tunnel | 50 | 1.08 s | 1.51 s | 300 |
+
+(s86k; for 100 requests with the current kernels see Speed.)
 
 A lone request takes 0.08 s for a 9 s clip (0.3 s before). Sharing a batch no longer changes a transcript: 100 of 100
 clips come out identical one at a time and all at once (`bench/batch_consistency.py`, Arena L2 WER 2.88 % both ways;
@@ -233,7 +270,7 @@ mostly no hamza (21 % of Arabic outputs against 64 % of references) and numbers 
 | `start.sh` | tmux + restart loop + optional quick tunnel |
 | `test/` | `make_clips.py` (public test clips from an Arena checkout), `run_tests.py` (formats, errors, routes), `arena_check.py`, `compare_check.py`, `scorer_check.py`, `lang_check.py` |
 | `norm_study/` | the normaliser and input-level studies above |
-| `kernels/` | the Triton kernels and CUDA graphs (see Speed) and Silero run in parallel |
+| `kernels/` | the CUDA kernels (`csrc/`) and their Python side: GPU features, packed encoder, continuous-batching decoder, the scheduling pipeline; Silero run in parallel (see Speed) |
 | `bench/` | `latency.py` and `speed.py` (against the model card's code), `stages.py`, `concurrency.py`, `batch_consistency.py` |
 
 The Arena scripts run from a checkout of the Arabic Arena (`github.com/kadirnar/arabic-arena`, branch `scoring-v2`) with
